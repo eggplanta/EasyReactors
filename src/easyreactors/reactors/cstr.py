@@ -1,11 +1,11 @@
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.optimize import minimize_scalar, root
+from scipy.optimize import minimize_scalar
 
 from ..core import ReactionSet
 from ..units import Value, to_si
-from ._common import flow_setup, key_species
+from ._common import flow_setup, key_species, solve
 from .result import Result
 from .stream import Stream
 
@@ -24,10 +24,10 @@ class CSTR:
         V = to_si(self.V if V is None else V, "m^3")
         species, F0, rate = flow_setup(self.reactions, feed, self.rho_b)
         scale = F0.sum()
-        sol = root(lambda F: (F0 - F + rate(F) * V) / scale, F0, method="hybr", tol=1e-12)
-        if not sol.success or (sol.x < -1e-9 * scale).any():
-            raise RuntimeError(f"CSTR did not converge: {sol.message}")
-        return self._result(feed, species, F0, sol.x, V, rate)
+        F = solve(lambda F: (F0 - F + rate(F) * V) / scale, F0, "CSTR")
+        if (F < -1e-9 * scale).any():
+            raise RuntimeError("CSTR converged to negative flows")
+        return self._result(feed, species, F0, F, V, rate)
 
     def size(self, feed: Stream, X: float, key: str | None = None) -> Result:
         species, F0, rate = flow_setup(self.reactions, feed, self.rho_b)
@@ -44,10 +44,8 @@ class CSTR:
         guess[i] = Fi
         r_i = rate(guess)[i]
         V_guess = (F0[i] - Fi) / -r_i if r_i < 0 else 1.0
-        sol = root(res, np.append(np.delete(guess, i), np.log(V_guess)), method="hybr", tol=1e-12)
-        if not sol.success:
-            raise RuntimeError(f"CSTR sizing did not converge: {sol.message}")
-        return self._result(feed, species, F0, full(sol.x), float(np.exp(sol.x[-1])), rate)
+        z = solve(res, np.append(np.delete(guess, i), np.log(V_guess)), "CSTR sizing")
+        return self._result(feed, species, F0, full(z), float(np.exp(z[-1])), rate)
 
     def optimum(self, feed: Stream, species: str, V_bounds=(1e-6, 1e4)) -> tuple[float, float]:
         def neg(logV):

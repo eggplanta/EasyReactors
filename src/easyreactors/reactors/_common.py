@@ -34,3 +34,11 @@ def flow_setup(rxns: ReactionSet, feed, rho_b=None):
         return rates(rxns, species, feed.conc(dict(zip(species, F))), feed.T, rho)
 
     return species, F0, rate
+
+
+def solve(fun, x0, what: str, tol: float = 1e-8) -> np.ndarray:
+    from scipy.optimize import root
+    sol = root(fun, x0, method="hybr", tol=1e-10)
+    if not np.all(np.isfinite(sol.fun)) or np.abs(sol.fun).max() > tol:
+        raise RuntimeError(f"{what} did not converge: {sol.message}")
+    return sol.x
