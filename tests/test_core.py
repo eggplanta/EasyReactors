@@ -46,7 +46,7 @@ def test_expression_blocks_code():
 
 def test_species_rates_ref():
     rx = Reaction("A + 2B -> C", PowerLaw(1.0, {}), ref="B")
-    assert rx.species_rates({}, 300) == {"A": -0.5, "B": -1.0, "C": 0.5}
+    assert rx.species_rates({"A": 1.0, "B": 1.0}, 300) == {"A": -0.5, "B": -1.0, "C": 0.5}
 
 
 def test_limiting_reactant():

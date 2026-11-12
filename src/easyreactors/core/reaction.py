@@ -49,6 +49,10 @@ class Reaction:
         return [s for s, v in self.nu.items() if v < 0]
 
     @property
+    def products(self) -> list[str]:
+        return [s for s, v in self.nu.items() if v > 0]
+
+    @property
     def delta(self) -> float:
         return sum(self.nu.values()) / abs(self.nu[self.ref])
 
@@ -62,5 +66,10 @@ class Reaction:
     def species_rates(self, C, T) -> dict[str, float]:
         if self.ref is None:
             raise AmbiguousReference(f"Reference species not set for: {self.equation}")
-        r = self.rate(C, T) / abs(self.nu[self.ref])
+        r = self.rate(C, T)
+        if r > 0 and any(C.get(s, 0.0) <= 0 for s in self.reactants):
+            r = 0.0
+        if r < 0 and any(C.get(s, 0.0) <= 0 for s in self.products):
+            r = 0.0
+        r /= abs(self.nu[self.ref])
         return {s: v * r for s, v in self.nu.items()}
