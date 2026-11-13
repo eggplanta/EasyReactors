@@ -82,3 +82,44 @@ def test_zero_order_stops_at_zero():
     res = Batch(rs, V=1.0).simulate(100.0, 300, C0={"A": 1.0})
     assert res.profile("A")[-1] == pytest.approx(0.0, abs=1e-6)
     assert res.profile("B")[-1] == pytest.approx(1.0, rel=1e-6)
+
+
+def test_zero_order_mm_equals_segregation():
+    from easyreactors.units import to_si
+    k = to_si("0.025 mol/(L*min)", "mol/(m^3*s)")
+    rs = ReactionSet([Reaction("A -> B", PowerLaw(k, {}))])
+    for m in ("trapezoid", "simpson", "pchip", "spline"):
+        r = RTD.from_E([0, 5, 10, 15, 20, 25, 30], [0, 0.03, 0.05, 0.05, 0.04, 0.02, 0.01], "min", m)
+        Xs = segregation(r, rs, {"A": "1.5 mol/L"}, 300).conversion("A")
+        Xm = max_mixedness(r, rs, {"A": "1.5 mol/L"}, 300).conversion("A")
+        assert Xm == pytest.approx(Xs, rel=0.005)
+
+
+def _laminar_rtd(tau):
+    from easyreactors.nonideal import E_laminar
+    t = tau / 2 * np.geomspace(1, 2000, 20001)
+    return RTD(t, E_laminar(t, tau))
+
+
+def test_fogler_17_1_laminar_first_order_exact():
+    from scipy.special import exp1
+    tau, k = 100.0, 0.02
+    Da = tau * k
+    exact = 1 - ((1 - Da / 2) * math.exp(-Da / 2) + (Da / 2) ** 2 * exp1(Da / 2))
+    rs = ReactionSet([Reaction("A -> B", PowerLaw(k, {"A": 1}))])
+    X = segregation(_laminar_rtd(tau), rs, {"A": 1.0}, 300).conversion("A")
+    assert X == pytest.approx(exact, rel=1e-4)
+
+
+def test_fogler_17_3_laminar_second_order():
+    from easyreactors.reactors import PFR
+    from easyreactors.units import to_si
+    k = to_si("4.93e-3 L/(mol*s)", "m^3/(mol*s)")
+    rs = ReactionSet([Reaction("A + B -> C + D", PowerLaw(k, {"A": 1, "B": 1}))])
+    C0 = {"A": "0.75 mol/L", "B": "0.75 mol/L"}
+    feed = Stream.liquid(v0="0.1 L/s", T="323 K", C=C0)
+    assert PFR(rs, V="100 L").simulate(feed).conversion("A") == pytest.approx(0.787, abs=0.001)
+    Da = 4.93e-3 * 0.75 * 1000
+    X = segregation(_laminar_rtd(1000.0), rs, C0, 323).conversion("A")
+    assert X == pytest.approx(Da * (1 - Da / 2 * math.log(1 + 2 / Da)), rel=1e-3)
+    assert X == pytest.approx(0.742, abs=0.001)

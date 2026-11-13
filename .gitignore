@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 dist/
+refs/
+CLAUDE.md
+CLAUDE.local.md
+.claude/

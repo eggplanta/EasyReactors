@@ -5,7 +5,7 @@ from typing import Literal
 import numpy as np
 from scipy.integrate import (cumulative_simpson, cumulative_trapezoid, simpson, solve_bvp,
                              solve_ivp, trapezoid)
-from scipy.interpolate import CubicSpline, PchipInterpolator
+from scipy.interpolate import CubicSpline, PchipInterpolator, make_interp_spline
 from scipy.optimize import brentq
 
 from ..core import ReactionSet
@@ -32,6 +32,14 @@ class RTD:
         self.t = t
         self.E = E / self.integrate(E)
         self.F = self.cumulative(self.E)
+        tf = np.linspace(self.t[0], self.t[-1], n_fine)
+        if method == "simpson" and len(self.t) >= 3:
+            Ef = np.clip(make_interp_spline(self.t, self.E, k=2)(tf), 0.0, None)
+        else:
+            Ef = np.interp(tf, self.t, self.E)
+        Ef /= trapezoid(Ef, tf)
+        Ff = cumulative_trapezoid(Ef, tf, initial=0.0)
+        self._fine = (tf, Ef / np.clip(1 - Ff, 1e-9, None))
 
     @classmethod
     def from_pulse(cls, t, C, t_unit: str = "s", method: Method = "trapezoid") -> "RTD":
@@ -135,7 +143,7 @@ def max_mixedness(rtd: RTD, reactions: ReactionSet, C0: dict, T) -> ModelResult:
     c0 = np.array([C0.get(s, 0.0) for s in species])
 
     def rhs(lam, C):
-        Lam = np.interp(lam, rtd.t, rtd.intensity)
+        Lam = np.interp(lam, *rtd._fine)
         return -rates(reactions, species, dict(zip(species, C)), T) + (C - c0) * Lam
 
     sol = solve_ivp(rhs, (rtd.t[-1], 0.0), c0, method="LSODA", rtol=1e-8, atol=1e-12 * c0.sum())
