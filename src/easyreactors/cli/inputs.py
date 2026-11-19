@@ -11,6 +11,18 @@ from ..units import Q_
 _NUMBER = re.compile(r"^\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*(.*?)\s*$")
 
 
+STYLE = questionary.Style([
+    ("qmark", "fg:#00afaf bold"),
+    ("question", "bold"),
+    ("answer", "fg:#5fd75f bold"),
+    ("pointer", "fg:#00afaf bold"),
+    ("highlighted", "fg:#00afaf bold"),
+    ("selected", "fg:#5fd75f"),
+    ("instruction", "fg:#808080 italic"),
+])
+UI = {"qmark": "›", "style": STYLE}
+
+
 class Back(Exception):
     pass
 
@@ -98,7 +110,7 @@ def _ask(question):
 
 
 def ask(message: str, parser: Callable = str, default: str = ""):
-    return parser(_ask(questionary.text(message, default=default, validate=checked(parser))))
+    return parser(_ask(questionary.text(message, default=default, validate=checked(parser), **UI)))
 
 
 def ask_quantity(message: str, si_unit: str, default_unit: str | None = None, default: str = "") -> float:
@@ -116,8 +128,8 @@ def ask_float(message: str, default: str = "", lo: float | None = None, hi: floa
 
 
 def select(message: str, choices: list[str], default: str | None = None) -> str:
-    return _ask(questionary.select(message, choices=choices, default=default))
+    return _ask(questionary.select(message, choices=choices, default=default, **UI))
 
 
 def confirm(message: str, default: bool = True) -> bool:
-    return _ask(questionary.confirm(message, default=default))
+    return _ask(questionary.confirm(message, default=default, **UI))

@@ -75,7 +75,7 @@ def _params(expr: str) -> list[str]:
 def ask_reactions() -> ReactionSet:
     reactions = []
     while True:
-        eq = ask("Reaction (e.g. 2A + B -> C, use <=> if reversible)", lambda s: parse_equation(s) and s.strip())
+        eq = ask("Reaction (e.g. 2A + B > C, reversible A <> B)", lambda s: parse_equation(s) and s.strip())
         nu, reversible = parse_equation(eq)
         reactants = [s for s, v in nu.items() if v < 0]
         ref = reactants[0] if len(reactants) == 1 else None

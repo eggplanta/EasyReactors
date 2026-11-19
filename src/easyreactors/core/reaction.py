@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Callable
 
-_ARROWS = re.compile(r"\s*(<=>|<->|->|=)\s*")
+_ARROWS = re.compile(r"\s*(<=>|<->|<>|->|=>|=|>)\s*")
 _TERM = re.compile(r"^(\d+(?:[./]\d+)?)?\s*([A-Za-z(].*)$")
 
 
@@ -24,7 +24,7 @@ def parse_equation(eq: str) -> tuple[dict[str, float], bool]:
                 raise ValueError(f"Invalid term '{term}' in: {eq}")
             coef = float(Fraction(m[1])) if m[1] else 1.0
             nu[m[2]] = nu.get(m[2], 0.0) + sign * coef
-    return nu, arrow != "->"
+    return nu, arrow not in ("->", "=>", ">")
 
 
 @dataclass

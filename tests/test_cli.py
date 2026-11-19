@@ -38,6 +38,14 @@ def test_rate_constant_units_match_to_si():
     assert quantity("2 L/mol", K_unit({"A": 2}, {"B": 1})) == pytest.approx(0.002)
 
 
+def test_simple_arrows():
+    from easyreactors.core import parse_equation
+    assert parse_equation("2A + B > C") == ({"A": -2, "B": -1, "C": 1}, False)
+    assert parse_equation("A => B")[1] is False
+    assert parse_equation("A <> B")[1] is True
+    assert parse_equation("A <=> B")[1] is True
+
+
 def test_numbers_and_mapping():
     assert numbers("0 5, 10  15").tolist() == [0, 5, 10, 15]
     assert numbers("95,8; 82,2\t70,6").tolist() == [95.8, 82.2, 70.6]
