@@ -3,10 +3,10 @@ import math
 import numpy as np
 import pytest
 
-from easyreactors.cli.inputs import mapping, numbers, quantity, table_file
-from easyreactors.cli.kinetics import K_unit, k_unit
-from easyreactors.cli.network import build, parse, to_text
-from easyreactors.cli.rtd import model_conversions, two_param_conversion
+from easyreactors.tui.compute import (ReactionSpec, build_feed, build_reactions, model_conversions,
+                                     run_batch, run_flow_reactor, two_param_conversion)
+from easyreactors.tui.netexpr import build, parse, to_text
+from easyreactors.tui.parsing import K_unit, k_unit, mapping, numbers, quantity, table_file
 from easyreactors.core import PowerLaw, Reaction, ReactionSet
 from easyreactors.network import size_network
 from easyreactors.nonideal import RTD, max_mixedness, segregation
@@ -121,3 +121,61 @@ def test_bypass_dead_conversion_first_order_analytic():
     Da = k * tau * a / (1 - b)
     assert rows["Model"] == pytest.approx((1 - b) * Da / (1 + Da), rel=1e-6)
     assert rows["Ideal CSTR (τ)"] == pytest.approx(k * tau / (1 + k * tau), rel=1e-6)
+
+
+# Form layer, Fogler examples
+
+def test_fogler_5_3_pfr_from_form():
+    rs = build_reactions([ReactionSpec("C2H6 > C2H4 + H2", k="0.072 1/s", Ea="82 kcal/mol", T_ref="1000")])
+    feed = build_feed("Gas", "1100", "6", "", "C2H6=0.425 lbmol/s")
+    rep = run_flow_reactor("PFR", "Size", rs, feed, X="0.8")
+    assert rep.summary[0].startswith("PFR: V = 2.288 m3")
+
+
+def test_fogler_8_3_and_8_4_maxima_from_form():
+    specs = [ReactionSpec("A > B", k="0.5 1/h"), ReactionSpec("B > C", k="0.2 1/h")]
+    tau = 1 / math.sqrt(0.5 * 0.2) * 60
+    rep = run_batch("Simulate", build_reactions(specs), "1000", "300", "A=2", t="10 h")
+    assert f"at t = {math.log(0.2 / 0.5) / (0.2 - 0.5) * 60:.4g} min" in rep.summary[1]
+    feed = build_feed("Liquid", "300", "", "1 m3/s", "A=2")
+    rep = run_flow_reactor("CSTR", "Maximize", build_reactions(specs), feed, species="B")
+    assert f"τ = {tau:.4g} min" in rep.summary[0]
+
+
+def test_reversible_and_missing_fields():
+    rs = build_reactions([ReactionSpec("A <> B", k="0.1 1/s", K="2")])
+    assert rs.reactions[0].reversible
+    with pytest.raises(ValueError, match="K of"):
+        build_reactions([ReactionSpec("A <> B", k="0.1 1/s")])
+    with pytest.raises(ValueError, match="required"):
+        build_reactions([ReactionSpec("A > B")])
+
+
+# App smoke test
+
+def test_app_examples_run():
+    import asyncio
+    from textual.widgets import DataTable, TabbedContent
+    from easyreactors.tui.app import EasyReactors
+
+    async def run():
+        app = EasyReactors()
+        out = {}
+        async with app.run_test(size=(160, 50)) as pilot:
+            for tab in ("tab-reactor", "tab-network", "tab-rtd", "tab-two"):
+                app.query_one(TabbedContent).active = tab
+                await pilot.pause()
+                await app.action_example()
+                await pilot.pause()
+                await app.action_run()
+                await app.workers.wait_for_complete()
+                await pilot.pause(0.2)
+                tables = list(app.pane().results.query(DataTable))
+                out[tab] = [str(c) for c in tables[0].get_row_at(0)] if tables else None
+        return out
+
+    out = asyncio.run(run())
+    assert out["tab-reactor"][0] == "EO"
+    assert out["tab-network"][1] == "3.02 m3"
+    assert out["tab-rtd"][1] == "37.25"
+    assert out["tab-two"][1] == "0.7017"

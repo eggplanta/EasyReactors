@@ -2,19 +2,9 @@ import re
 from dataclasses import dataclass, field
 
 from ..core import ReactionSet
-from ..network import Bypass, Parallel, Recycle, Series, SideFeed, size_network, size_split
-from ..network.ascii import fmt_volume
+from ..network import Bypass, Parallel, Recycle, Series, SideFeed
 from ..reactors import CSTR, PFR, Stream
-from .inputs import ask, ask_float, confirm, numbers, quantity, select
-from .kinetics import ask_reactions
-from .output import fmt, header, info, table
-from .reactors import ask_X, stream_table
-from .streams import ask_feed, ask_side_feed, per_min
-
-SYNTAX = ("Syntax: CSTR(5 m3) > PFR(?) ; parallel [CSTR(1 m3) | PFR(2 m3)]{0.3, 0.7} "
-          "(split optional, {?} = size it) ; bypass ; side feed 'feed' ; recycle(PFR(1 m3), 2). "
-          "V without units is in L; ? or empty = unknown V.")
-
+from .parsing import numbers, quantity
 
 # Network expression
 
@@ -200,99 +190,3 @@ def build(spec: list, rs: ReactionSet) -> Built:
     if out.sized_split is not None and any(r.V is None for r in out.net.reactors()):
         raise ValueError("Size either an unknown volume or a split, not both")
     return out
-
-
-# Guided builder
-
-def _guided(nested: bool = False) -> list:
-    items = []
-    while True:
-        if items:
-            info(("  branch: " if nested else "Network: ") + to_text(items))
-        choices = ["CSTR", "PFR", "Parallel branches", "Recycle around a sub-network", "Side feed"]
-        if nested:
-            choices.append("Bypass (empty branch)")
-        if items:
-            choices.append("Done" if not nested else "End branch")
-        c = select("Add", choices)
-        if c in ("CSTR", "PFR"):
-            V = ask("Volume (? = unknown, size it) [L]",
-                    lambda s: s if s.strip() in ("", "?") else quantity(s, "m^3", "L") and s, "?")
-            items.append(UnitSpec(c, None if V.strip() in ("", "?") else V.strip()))
-        elif c == "Parallel branches":
-            n = int(ask_float("Number of branches", "2", lo=2))
-            branches = []
-            for k in range(n):
-                info(f"Branch {k + 1} of {n}")
-                branches.append(_guided(True))
-            s = select("Split", ["Equal", "Fractions", "Unknown (size it)"])
-            split = None if s == "Equal" else "?" if s.startswith("Unknown") else list(
-                ask(f"{n} fractions summing to 1 (e.g. 0.3, 0.7)", _fractions(n)))
-            items.append(ParSpec(branches, split))
-        elif c.startswith("Recycle"):
-            info("Recycle loop contents")
-            body = _guided(True)
-            items.append(RecycleSpec(body, ask_float("Recycle ratio R = recycled / leaving", lo=0)))
-        elif c == "Side feed":
-            items.append(FeedSpec())
-        elif c.startswith("Bypass"):
-            items.append(BypassSpec())
-        else:
-            return items
-
-
-def _fractions(n: int):
-    def parse(s):
-        f = numbers(s)
-        if len(f) != n or abs(f.sum() - 1) > 1e-6:
-            raise ValueError(f"Need {n} fractions summing to 1")
-        return f
-    return parse
-
-
-# Menu
-
-def _unit_rows(res, key: str):
-    rows = []
-    for u in res.units:
-        Fi, Fo = u.inlet.F.get(key, 0.0), u.outlet.F.get(key, 0.0)
-        rows.append([u.name, fmt_volume(u.V)[2:], per_min(Fi), per_min(Fo), (Fi - Fo) / Fi if Fi else None])
-    return rows
-
-
-def menu() -> None:
-    if select("Build network", ["Guided", "Expression"]) == "Guided":
-        spec = _guided()
-    else:
-        info(SYNTAX)
-        spec = ask("Network", parse)
-    rs = ask_reactions()
-    feed = ask_feed(rs)
-    feeds = [x for x in walk(spec) if isinstance(x, FeedSpec)]
-    for k, x in enumerate(feeds):
-        info(f"Side feed {k + 1} of {len(feeds)}")
-        x.stream = ask_side_feed(feed)
-    built = build(spec, rs)
-    net = built.net
-    if any(r.V is None for r in net.reactors()):
-        info("Reactors with unknown V get the same volume")
-        X, key = ask_X(rs)
-        res = size_network(net, feed, X, key)
-    elif built.sized_split is not None:
-        key = rs.reactions[0].ref
-        if select("Split criterion", ["Target overall conversion", "Equal conversion in all branches"]).startswith("Equal"):
-            res = size_split(net, built.sized_split, feed, key=key, equal_conversion=True)
-        else:
-            X, key = ask_X(rs)
-            res = size_split(net, built.sized_split, feed, X, key)
-        node = res.ctx.nodes[id(built.sized_split)]
-        info("Sized split: " + ", ".join(fmt(f) for f in node.split))
-    else:
-        key = rs.reactions[0].ref
-        res = net.simulate(feed)
-    header(f"Network: {to_text(spec)}")
-    print(res.draw(key))
-    table(f"Units (key species {key})", ["Unit", "V", f"F{key} in [mol/min]", f"F{key} out [mol/min]", "X unit"],
-          _unit_rows(res, key))
-    info(f"Overall conversion X_{key} = {fmt(res.conversion(key))} (based on all {key} fed)")
-    stream_table("Outlet", Stream(res.fed, feed.T, feed.P, feed.phase, None), res.outlet, list(res.outlet.F))

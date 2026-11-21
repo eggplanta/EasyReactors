@@ -13,15 +13,15 @@ dependencies = [
     "numpy>=2.5.4",
     "pint>=0.26.2",
     "plotext>=6.1.0",
-    "questionary>=2.1.1",
     "rich>=15.0.0",
     "scipy>=1.18.1",
     "sympy>=1.14.0",
+    "textual>=8.2.8",
     "thermo>=0.6.1",
 ]
 
 [project.scripts]
-easyreactors = "easyreactors.cli.main:app"
+easyreactors = "easyreactors.tui.app:main"
 
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]
