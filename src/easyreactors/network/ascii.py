@@ -24,12 +24,15 @@ def fmt_volume(V: float) -> str:
     return f"V={V * 1000:.4g} L" if V < 1 else f"V={V:.4g} m3"
 
 
-def _unit(node: UnitNode) -> Box:
-    edge = "=" if node.kind == "PFR" else "-"
-    text = fmt_volume(node.V)
-    w = max(len(node.name) + 8, len(text) + 4)
-    top = "+" + f"[{node.name}]".center(w - 2, edge) + "+"
+def unit_box(name: str, kind: str, text: str) -> Box:
+    edge = "=" if kind == "PFR" else "-"
+    w = max(len(name) + 8, len(text) + 4)
+    top = "+" + f"[{name}]".center(w - 2, edge) + "+"
     return Box([top, "|" + text.center(w - 2) + "|", "+" + edge * (w - 2) + "+"], 1)
+
+
+def _unit(node: UnitNode) -> Box:
+    return unit_box(node.name, node.kind, fmt_volume(node.V))
 
 
 def _hcat(boxes: list[Box], sep: str = "--->") -> Box:
@@ -43,8 +46,7 @@ def _hcat(boxes: list[Box], sep: str = "--->") -> Box:
     return Box(lines, above)
 
 
-def _parallel(node: ParallelNode) -> Box:
-    boxes = [_box(c) for c in node.children]
+def parallel_box(boxes: list[Box], labels: list[str]) -> Box:
     w = max(b.width for b in boxes)
     lines, rows = [], []
     for k, b in enumerate(boxes):
@@ -56,8 +58,7 @@ def _parallel(node: ParallelNode) -> Box:
     out = []
     for i, l in enumerate(lines):
         if i in rows:
-            f = node.split[rows.index(i)]
-            out.append(f"+-{f:.2f}-->" + l + "-+")
+            out.append(f"+-{labels[rows.index(i)]:-^4}-->" + l + "-+")
         elif first < i < last:
             out.append("|" + " " * 8 + l.ljust(w) + " |")
         else:
@@ -65,18 +66,24 @@ def _parallel(node: ParallelNode) -> Box:
     return Box(out, first)
 
 
-def _side_feed(node: SideFeedNode) -> Box:
-    F = sum(node.stream.F.values())
-    names = ",".join(k for k, v in node.stream.F.items() if v > 0)
-    label = f"+{names} F={F:.4g} mol/s"
+def _parallel(node: ParallelNode) -> Box:
+    return parallel_box([_box(c) for c in node.children], [f"{f:.2f}" for f in node.split])
+
+
+def feed_box(label: str) -> Box:
     w = max(len(label), 7)
     c = w // 2
     return Box([label.ljust(w), (" " * c + "|").ljust(w), (" " * c + "v").ljust(w),
                 "-" * c + "+" + "-" * (w - c - 1)], 3)
 
 
-def _recycle(node: RecycleNode) -> Box:
-    b = _box(node.child)
+def _side_feed(node: SideFeedNode) -> Box:
+    F = sum(node.stream.F.values())
+    names = ",".join(k for k, v in node.stream.F.items() if v > 0)
+    return feed_box(f"+{names} F={F * 60:.4g} mol/min")
+
+
+def recycle_box(b: Box, R: str) -> Box:
     w, r, h = b.width, b.row, len(b.lines)
     body = b.padded(r, h - r - 1, w)
     lines = []
@@ -87,9 +94,16 @@ def _recycle(node: RecycleNode) -> Box:
             lines.append((" ^  " if i == r + 1 else " |  ") + l + " |  ")
         else:
             lines.append("    " + l + "    ")
-    lines.append((" ^  " if r == h - 1 else " |  ") + f"R={node.R:g}".center(w) + " |  ")
+    lines.append((" ^  " if r == h - 1 else " |  ") + f"R={R}".center(w) + " |  ")
     lines.append(" +" + "-" * (w + 3) + "+  ")
     return Box(lines, r)
+
+
+def _recycle(node: RecycleNode) -> Box:
+    return recycle_box(_box(node.child), f"{node.R:g}")
+
+
+BYPASS = Box(["-----"], 0)
 
 
 def _box(node) -> Box:
@@ -104,24 +118,27 @@ def _box(node) -> Box:
     if isinstance(node, RecycleNode):
         return _recycle(node)
     if isinstance(node, BypassNode):
-        return Box(["-----"], 0)
+        return BYPASS
     raise TypeError(f"Cannot draw {node!r}")
 
 
-def draw(res, key: str | None = None) -> str:
-    key = key or next(iter(res.feed.F))
-    box = _box(res.tree)
+def frame(box: Box, left: list[str], right: list[str]) -> str:
     above, below = max(box.row, 1), max(len(box.lines) - box.row - 1, 1)
     body = box.padded(above, below)
-    left = [f"F0={sum(res.feed.F.values()):.4g} mol/s", "X=0", f"T={res.feed.T:.4g} K"]
-    right = [f"F={sum(res.outlet.F.values()):.4g} mol/s", f"X={res.conversion(key):.4g}",
-             f"T={res.outlet.T:.4g} K"]
     lw = max(len(s) for s in left)
     out = []
     for i, l in enumerate(body):
         j = i - (above - 1)
-        lab = left[j] if 0 <= j < 3 else ""
-        rab = right[j] if 0 <= j < 3 else ""
+        lab = left[j] if 0 <= j < len(left) else ""
+        rab = right[j] if 0 <= j < len(right) else ""
         arrow_in, arrow_out = ("--->", "---> ") if i == above else ("    ", "     ")
         out.append((lab.ljust(lw) + " " + arrow_in + l + arrow_out + rab).rstrip())
     return "\n".join(out)
+
+
+def draw(res, key: str | None = None) -> str:
+    key = key or next(iter(res.feed.F))
+    left = [f"F0={sum(res.feed.F.values()) * 60:.4g} mol/min", "X=0", f"T={res.feed.T:.4g} K"]
+    right = [f"F={sum(res.outlet.F.values()) * 60:.4g} mol/min", f"X={res.conversion(key):.4g}",
+             f"T={res.outlet.T:.4g} K"]
+    return frame(_box(res.tree), left, right)

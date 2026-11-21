@@ -1,4 +1,5 @@
 import re
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,8 @@ def quantity(text: str, si_unit: str, default_unit: str | None = None) -> float:
     if not m:
         raise ValueError(f"Not a number with units: '{text}'")
     unit = re.sub(r"([A-Za-z])(-?\d+(?:\.\d+)?)", r"\1**\2", m[2]) or default_unit or si_unit
+    if re.search(r"[*/]", unit):
+        unit = re.sub(r"(?<!delta_)\b(deg[CF]|°[CF])\b", lambda d: "delta_deg" + d[1][-1], unit)
     try:
         return float(Q_(_product(m[1]), unit).to(si_unit).magnitude)
     except pint.DimensionalityError:
@@ -110,4 +113,32 @@ def K_unit(orders_f: dict, orders_r: dict, basis: str = "C") -> str:
 
 
 def orders(text: str) -> dict[str, float]:
-    return {s: float(v) for s, v in mapping(text).items()}
+    try:
+        return {s: float(Fraction(v.strip())) for s, v in mapping(text).items()}
+    except (ValueError, ZeroDivisionError):
+        raise ValueError(f"Orders must be numbers or fractions, e.g. A=1, B=1/2: '{text}'")
+
+
+def human_k(order: float, basis: str = "C", per_mass: bool = False) -> str:
+    space = "kg" if per_mass else "L"
+    n = round(order, 6)
+    if n == 0:
+        return f"mol/({space}*min)"
+    if basis == "P":
+        p = "atm" if n == 1 else f"atm^{n:g}"
+        return f"mol/({space}*min*{p})"
+    if per_mass:
+        return "L/(kg*min)" if n == 1 else f"L^{n:g}/(mol^{n - 1:g}*kg*min)"
+    if n == 1:
+        return "1/min"
+    if n == 2:
+        return "L/(mol*min)"
+    return f"L^{n - 1:g}/(mol^{n - 1:g}*min)"
+
+
+def human_K(orders_f: dict, orders_r: dict, basis: str = "C") -> str:
+    n = round(sum(orders_r.values()) - sum(orders_f.values()), 6)
+    if n == 0:
+        return "dimensionless"
+    unit = "atm" if basis == "P" else "mol/L"
+    return unit if n == 1 else f"({unit})^{n:g}"

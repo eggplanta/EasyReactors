@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
@@ -17,6 +17,7 @@ class Result:
     n0: dict[str, float]
     outlet: Stream | None = None
     interp: Callable | None = None
+    extras: dict[str, np.ndarray] = field(default_factory=dict)
 
     @property
     def end(self) -> float:

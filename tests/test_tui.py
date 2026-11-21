@@ -32,6 +32,16 @@ def test_quantity_units_and_defaults():
         quantity("abc", "m^3")
 
 
+def test_human_units_parse_to_the_expected_si_units():
+    from easyreactors.tui.parsing import human_K, human_k
+    for n in (0, 0.5, 1, 2, 3):
+        for basis in ("C", "P"):
+            for per_mass in (False, True):
+                assert quantity(f"1 {human_k(n, basis, per_mass)}", k_unit(n, basis, per_mass)) > 0
+    assert human_K({"A": 1}, {"B": 2}) == "mol/L"
+    assert quantity("1 " + human_K({"A": 2}, {"B": 1}).replace("^", "**"), K_unit({"A": 2}, {"B": 1})) > 0
+
+
 def test_rate_constant_units_match_to_si():
     assert quantity("0.025 mol/(L*min)", k_unit(0)) == pytest.approx(to_si("0.025 mol/L/min", "mol/m^3/s"))
     assert quantity("2 mol/L", K_unit({"A": 1}, {"B": 2})) == pytest.approx(2000)
@@ -149,6 +159,9 @@ def test_reversible_and_missing_fields():
         build_reactions([ReactionSpec("A <> B", k="0.1 1/s")])
     with pytest.raises(ValueError, match="required"):
         build_reactions([ReactionSpec("A > B")])
+    with pytest.raises(ValueError, match=r"Reaction 2 \(2A > D\): k has the wrong units for total order 1: use "
+                                         r"something like 1/min"):
+        build_reactions([ReactionSpec("A > B", k="0.1 1/s"), ReactionSpec("2A > D", orders="A=1", k="0.05 L/(mol*min)")])
 
 
 # App smoke test
@@ -162,7 +175,7 @@ def test_app_examples_run():
         app = EasyReactors()
         out = {}
         async with app.run_test(size=(160, 50)) as pilot:
-            for tab in ("tab-reactor", "tab-network", "tab-rtd", "tab-two", "tab-diff"):
+            for tab in ("tab-reactor", "tab-network", "tab-trans", "tab-rtd", "tab-two", "tab-diff"):
                 app.query_one(TabbedContent).active = tab
                 await pilot.pause()
                 await app.action_example()
@@ -177,6 +190,7 @@ def test_app_examples_run():
     out = asyncio.run(run())
     assert out["tab-reactor"][0] == "EO"
     assert out["tab-network"][1] == "3.02 m3"
+    assert out["tab-trans"][0] == "A"
     assert out["tab-rtd"][1] == "37.25"
     assert out["tab-two"][1] == "0.7017"
     assert out["tab-diff"] == ["Thiele modulus φ (at Cs)", "18.01"]
@@ -206,3 +220,49 @@ def test_diffusion_forms_fogler():
 def test_quantity_accepts_numeric_products():
     assert quantity("1/3 h", "s") == pytest.approx(1200)
     assert quantity("5 1/min", "1/s") == pytest.approx(5 / 60)
+
+
+# Energy, PBR and transient forms (Fogler 11-3, 12-6, 5-7, 6-3)
+
+def test_energy_forms_fogler():
+    from easyreactors.tui.compute import (DropSpec, EnergySpec, build_heat, run_flow_reactor, run_semibatch,
+                                         run_startup)
+    specs = [ReactionSpec("A <> B", model="Reversible", orders="A=1", reverse_orders="B=1", k="31.1 1/h",
+                          Ea="65.7 kJ/mol", T_ref="360", K="3.03", dH="-6900 J/mol", K_T="333")]
+    feed = build_feed("Liquid", "330", "", "262.9", "A=9.3, I=1.033")
+    heat = build_heat(EnergySpec("Adiabatic", "A=141, B=141, I=161"), specs, False)
+    rep = run_flow_reactor("PFR", "Size", build_reactions(specs), feed, X="0.4", heat=heat)
+    assert rep.summary[0].startswith("PFR: V = 1.149 m3")
+    assert any("Adiabatic equilibrium" in line for line in rep.summary)
+    specs = [ReactionSpec("A > B", k="3.3 1/min", Ea="9900 cal/mol", T_ref="300", dH="-55000 J/mol"),
+             ReactionSpec("B > C", k="4.58 1/min", Ea="27000 cal/mol", T_ref="500", dH="-71500 J/mol")]
+    heat = build_heat(EnergySpec("Heat exchange (constant Ta)", "A=200, B=200, C=200", "40000 J/(min*K)", "330"),
+                      specs, True)
+    rep = run_flow_reactor("CSTR", "Simulate", build_reactions(specs),
+                           build_feed("Liquid", "283", "", "1000", "A=0.3"), V="10", heat=heat)
+    assert "5 steady states" in rep.summary[0]
+    with pytest.raises(ValueError, match="ΔHrx of"):
+        build_heat(EnergySpec("Adiabatic", "A=1"), [ReactionSpec("A > B", k="1 1/s")], False)
+    specs = [ReactionSpec("A + 0.5B > C", ref="A", orders="A=1/3, B=2/3", k="0.00392 mol/(atm*kg*s)", basis="P",
+                          catalytic=True)]
+    feed = build_feed("Gas", "260 degC", "10", "", "A=0.1362 mol/s, B=0.0681 mol/s, I=0.256 mol/s")
+    rep = run_flow_reactor("PBR", "Size", build_reactions(specs), feed, X="0.6", drop=DropSpec("α given", "0.0367"))
+    assert rep.summary[0] == "PBR: W = 20.58 kg"
+    rep = run_semibatch(build_reactions([ReactionSpec("A + B > C + D", ref="A", k="2.2 L/(mol*s)")]), "5", "300",
+                        "A=0.05", "0.05 L/s", "B=0.025", "500 s")
+    assert rep.summary[0].startswith("Semibatch: t = 8.333 min, V = 5 L → 30 L")
+    rep = run_startup(build_reactions([ReactionSpec("A > B", k="0.02 1/min")]), "500",
+                      build_feed("Liquid", "300", "", "4", "A=3"), "A=0.5", "300")
+    assert f"t_s = {125 / 3.5 * math.log(100):.4g} min" in rep.summary[1]
+
+
+def test_ergun_from_bed_data_fogler_5_4():
+    from easyreactors.tui.compute import DropSpec, build_drop
+    from easyreactors.units import to_si
+    v0 = to_si("252.8 ft^3/h", "m^3/s")
+    feed = Stream(F={"A": 1.0}, T=533.15, P=to_si("10 atm", "Pa"), phase="gas")
+    feed.F = {"A": v0 * feed.P / (8.314462618 * feed.T)}
+    alpha, rho_b, notes = build_drop(DropSpec("Ergun (bed data)", Ac="0.01414 ft^2", Dp="0.0208 ft", porosity="0.45",
+                                              rho_c="120 lb/ft^3", mu="0.0673 lb/(ft*h)", rho0="0.413 lb/ft^3"), feed)
+    assert alpha == pytest.approx(0.0367, abs=3e-4)
+    assert rho_b == pytest.approx(to_si("120 lb/ft^3", "kg/m^3") * 0.55)

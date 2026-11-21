@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 from ..core import ReactionSet
 from ..network import Bypass, Parallel, Recycle, Series, SideFeed
+from ..network.ascii import BYPASS, _hcat, feed_box, frame, parallel_box, recycle_box, unit_box
 from ..reactors import CSTR, PFR, Stream
 from .parsing import numbers, quantity
 
@@ -190,3 +191,26 @@ def build(spec: list, rs: ReactionSet) -> Built:
     if out.sized_split is not None and any(r.V is None for r in out.net.reactors()):
         raise ValueError("Size either an unknown volume or a split, not both")
     return out
+
+
+def sketch(spec: list) -> str:
+    count = {"CSTR": 0, "PFR": 0}
+
+    def item(x):
+        if isinstance(x, UnitSpec):
+            count[x.kind] += 1
+            return unit_box(f"{x.kind}-{count[x.kind]}", x.kind, f"V={x.V}" if x.V else "V=?")
+        if isinstance(x, ParSpec):
+            n = len(x.branches)
+            labels = (["?"] * n if x.split == "?" else [f"{f:.2f}" for f in x.split] if x.split
+                      else [f"{1 / n:.2f}"] * n)
+            return parallel_box([series(b) for b in x.branches], labels)
+        if isinstance(x, RecycleSpec):
+            return recycle_box(series(x.body), f"{x.R:g}")
+        return BYPASS if isinstance(x, BypassSpec) else feed_box("+side feed")
+
+    def series(items):
+        boxes = [item(x) for x in items]
+        return boxes[0] if len(boxes) == 1 else _hcat(boxes)
+
+    return frame(series(spec), ["", "feed"], ["", "outlet"])

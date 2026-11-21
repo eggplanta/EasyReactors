@@ -1,9 +1,15 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
 from ..core import (Arrhenius, Expression, MichaelisMenten, PowerLaw, Reaction, ReactionSet, Reversible,
-                    parse_equation)
+                    VantHoff, parse_equation)
+from ..core.rates import R as R_GAS
+from ..energy.equilibrium import adiabatic_equilibrium
+from ..energy.heat import Heat, dH_from_formation, lookup
+from ..reactors.pfr import PBR
+from ..reactors.pressure import ergun_alpha, ergun_beta0
+from ..reactors.transient import CSTRStartup, Semibatch
 from ..network import size_network, size_split
 from ..network.ascii import fmt_volume
 from ..nonideal import (RTD, bypass_dead, dispersion, fit_bypass_dead, fit_interchange, fit_pfr_bypass,
@@ -17,7 +23,7 @@ from ..diffusion.pellet import (effectiveness, eta_first_order, mears, radius_fo
                                 weisz_prater)
 from ..diffusion.transport import (bed_area, colburn, cylinder_dp, effective_diffusivity, frossling,
                                    mt_limited_conversion, thoenes_kramers)
-from .parsing import K_unit, amounts, k_unit, mapping, orders, quantity, series
+from .parsing import K_unit, amounts, human_K, human_k, k_unit, mapping, orders, quantity, series
 
 MODELS = ["Power law", "Reversible", "Michaelis-Menten", "Expression"]
 RTD_KINDS = ["Pulse C(t)", "Step C(t)", "E(t)"]
@@ -55,6 +61,8 @@ class ReactionSpec:
     expr: str = ""
     params: str = ""
     catalytic: bool = False
+    dH: str = ""
+    K_T: str = ""
 
 
 def _elementary(nu: dict, sign: int) -> dict[str, float]:
@@ -67,8 +75,14 @@ def _required(text: str, name: str) -> str:
     return text
 
 
-def _k(spec: ReactionSpec, si_unit: str):
-    k = quantity(_required(spec.k, f"k of {spec.equation}"), si_unit)
+def _k(spec: ReactionSpec, si_unit: str, order: float = 1.0):
+    try:
+        k = quantity(_required(spec.k, f"k of {spec.equation}"), si_unit)
+    except ValueError as e:
+        if not str(e).startswith("Wrong units"):
+            raise
+        raise ValueError(f"k has the wrong units for total order {order:g}: use something like "
+                         f"{human_k(order, spec.basis, spec.catalytic)} (got '{spec.k}')") from None
     if not spec.Ea.strip():
         return k
     return Arrhenius.from_ref(k, quantity(spec.Ea, "J/mol", "J/mol"),
@@ -92,17 +106,32 @@ def build_reaction(spec: ReactionSpec) -> Reaction:
         of = orders(spec.orders) if spec.orders.strip() else _elementary(nu, -1)
         if spec.model == "Reversible" or reversible:
             orr = orders(spec.reverse_orders) if spec.reverse_orders.strip() else _elementary(nu, 1)
-            K = quantity(_required(spec.K, f"K of {eq}"), K_unit(of, orr, spec.basis))
-            rate = Reversible(_k(spec, k_unit(sum(of.values()), spec.basis, spec.catalytic)), of, orr, K, spec.basis)
+            try:
+                K = quantity(_required(spec.K, f"K of {eq}"), K_unit(of, orr, spec.basis))
+            except ValueError as e:
+                if not str(e).startswith("Wrong units"):
+                    raise
+                raise ValueError(f"K has the wrong units: use {human_K(of, orr, spec.basis)} (got '{spec.K}')") from None
+            if spec.dH.strip() and spec.K_T.strip():
+                K = VantHoff(K, quantity(spec.dH, "J/mol", "J/mol"), quantity(spec.K_T, "K", "K"))
+            rate = Reversible(_k(spec, k_unit(sum(of.values()), spec.basis, spec.catalytic), sum(of.values())), of, orr, K,
+                              spec.basis)
         else:
-            rate = PowerLaw(_k(spec, k_unit(sum(of.values()), spec.basis, spec.catalytic)), of, spec.basis)
+            rate = PowerLaw(_k(spec, k_unit(sum(of.values()), spec.basis, spec.catalytic), sum(of.values())), of,
+                            spec.basis)
     return Reaction(eq, rate, ref=ref, catalytic=spec.catalytic)
 
 
 def build_reactions(specs: list[ReactionSpec]) -> ReactionSet:
     if not specs:
         raise ValueError("Add at least one reaction")
-    return ReactionSet([build_reaction(s) for s in specs])
+    built = []
+    for i, s in enumerate(specs, 1):
+        try:
+            built.append(build_reaction(s))
+        except ValueError as e:
+            raise ValueError(f"Reaction {i} ({s.equation.strip()}): {e}") from e
+    return ReactionSet(built)
 
 
 def resolve(rs: ReactionSet, feed: dict[str, float]) -> list[str]:
@@ -172,47 +201,194 @@ def _X(text: str) -> float:
     return X
 
 
+# Energy and pressure drop
+
+ENERGY_MODES = ["Isothermal", "Adiabatic", "Heat exchange (constant Ta)"]
+DROP_MODES = ["None", "α given", "Ergun (bed data)"]
+
+
+@dataclass
+class EnergySpec:
+    mode: str = "Isothermal"
+    Cp: str = ""
+    Ua: str = ""
+    Ta: str = ""
+    T_ref: str = ""
+
+
+@dataclass
+class DropSpec:
+    mode: str = "None"
+    alpha: str = ""
+    rho_b: str = ""
+    Ac: str = ""
+    Dp: str = ""
+    porosity: str = ""
+    rho_c: str = ""
+    mu: str = ""
+    rho0: str = ""
+
+
+def build_heat(e: EnergySpec | None, specs: list[ReactionSpec], total_ua: bool) -> Heat | None:
+    if e is None or e.mode == "Isothermal":
+        return None
+    dH = [quantity(_required(s.dH, f"ΔHrx of {s.equation}"), "J/mol", "J/mol") for s in specs]
+    Cp = amounts(_required(e.Cp, "Heat capacities Cp"), "J/mol/K", "J/mol/K")
+    T_ref = quantity(e.T_ref, "K", "K") if e.T_ref.strip() else 298.15
+    if not e.mode.startswith("Heat"):
+        return Heat(dH, Cp, T_ref)
+    Ua = quantity(_required(e.Ua, "UA" if total_ua else "Ua"), "W/K" if total_ua else "W/m^3/K",
+                  "W/K" if total_ua else "W/m^3/K")
+    return Heat(dH, Cp, T_ref, Ua, quantity(_required(e.Ta, "Coolant Ta"), "K", "K"))
+
+
+def build_drop(d: DropSpec | None, feed: Stream) -> tuple[float, float | None, list[str]]:
+    if d is None:
+        return 0.0, None, []
+    rho_b = _opt(d.rho_b, "kg/m^3", "kg/m^3")
+    if d.mode == "α given":
+        return _q(d.alpha, "α", "1/kg", "1/kg"), rho_b, []
+    if d.mode.startswith("Ergun"):
+        Ac, phi = _q(d.Ac, "Ac", "m^2", "m^2"), float(_required(d.porosity, "Porosity φ"))
+        rho0, rho_c = _q(d.rho0, "Gas density ρ0", "kg/m^3", "kg/m^3"), _q(d.rho_c, "ρc", "kg/m^3", "kg/m^3")
+        G = rho0 * feed.v / Ac
+        beta0 = ergun_beta0(G, rho0, _q(d.mu, "Viscosity μ", "Pa*s", "Pa*s"), _q(d.Dp, "Dp", "m", "mm"), phi)
+        alpha = ergun_alpha(beta0, Ac, rho_c, phi, feed.P)
+        notes = [f"Ergun: G = {G:.4g} kg/(m2·s), β0 = {beta0 / 1000:.4g} kPa/m, α = {alpha:.4g} 1/kg"]
+        return alpha, rho_b if rho_b is not None else rho_c * (1 - phi), notes
+    return 0.0, rho_b, []
+
+
+def lookup_properties(names: str, T: str, specs: list[ReactionSpec], phase: str = "Gas") -> tuple[str, list[str]]:
+    m = mapping(_required(names, "Species names (A=n-butane, ...)"))
+    T = quantity(T, "K", "K") if T.strip() else 298.15
+    props = {s: lookup(n, T, phase.lower()) for s, n in m.items()}
+    Cp = ", ".join(f"{s}={p.Cp:.4g}" for s, p in props.items())
+    Hf = {s: p.Hf for s, p in props.items() if p.Hf is not None}
+    dH = []
+    for spec in specs:
+        try:
+            rx = build_reaction(replace(spec, model="Expression", expr="0", params=""))
+            dH.append(f"{dH_from_formation(rx, Hf) / 1000:.6g} kJ/mol" if rx.ref else "")
+        except ValueError:
+            dH.append("")
+    return Cp, dH
+
+
+def _gas_conc(feed: Stream, res: Result) -> np.ndarray:
+    T = res.extras.get("T", np.full(len(res.axis), feed.T))
+    p = res.extras.get("p", np.ones(len(res.axis)))
+    if feed.phase == "liquid":
+        return res.n / feed.v0
+    return res.n / res.n.sum(axis=1)[:, None] * (feed.P * p / (R_GAS * T))[:, None]
+
+
+def _equilibrium_note(rs: ReactionSet, heat: Heat, feed: Stream, res: Result) -> list[str]:
+    rx = rs.reactions[0]
+    if len(rs.reactions) > 1 or not rx.reversible or heat.exchange:
+        return []
+    conc = (lambda F, T: feed.conc(F)) if feed.phase == "liquid" else (
+        lambda F, T: {s: f / sum(F.values()) * feed.P / (R_GAS * T) for s, f in F.items()})
+    try:
+        Xe, Te = adiabatic_equilibrium(rx, heat, res.species, feed.F, conc, feed.T)
+    except ValueError:
+        return []
+    return [f"Adiabatic equilibrium: X_{rx.ref} = {Xe:.4g} at T = {Te:.4g} K"]
+
+
 def run_flow_reactor(kind: str, mode: str, rs: ReactionSet, feed: Stream, V: str = "", X: str = "",
-                     key: str = "", species: str = "") -> Report:
+                     key: str = "", species: str = "", heat: Heat | None = None,
+                     drop: DropSpec | None = None) -> Report:
     rep = Report(resolve(rs, feed.F))
-    reactor = (CSTR if kind == "CSTR" else PFR)(rs)
+    pbr = kind == "PBR"
+    size_unit, size_si, size_name = ("kg", "kg", "W") if pbr else ("L", "m^3", "V")
+    if pbr:
+        alpha, rho_b, notes = build_drop(drop, feed)
+        rep.summary += notes
+        reactor = PBR(rs, rho_b=rho_b, heat=heat, alpha=alpha)
+    else:
+        reactor = (CSTR if kind == "CSTR" else PFR)(rs, heat=heat)
+    fmt_size = (lambda w: f"{w:.4g} kg") if pbr else (lambda v: fmt_volume(v)[2:])
+    if kind == "CSTR" and heat is not None and mode == "Simulate":
+        return _cstr_states(rep, reactor, feed, quantity(_required(V, "Volume"), "m^3", "L"), _key(rs, key))
     if mode == "Maximize":
+        if heat is not None and kind == "CSTR":
+            raise ValueError("Maximize with energy balance: use PFR, or Simulate the CSTR")
         s = _required(species, "Species to maximize").strip()
-        bounds = (feed.v * 1e-2, feed.v * 1e8)
         if kind == "CSTR":
-            Vopt, _ = reactor.optimum(feed, s, bounds)
+            Vopt, _ = reactor.optimum(feed, s, (feed.v * 1e-2, feed.v * 1e8))
         else:
-            V_max = quantity(V, "m^3", "L") if V.strip() else feed.v * 1e6
-            Vopt, _ = reactor.simulate(feed, V_max, n_points=2000).optimum(s)
+            end = quantity(V, size_si, size_unit) if V.strip() else (feed.v * 1e6 if not pbr else 1e6)
+            Vopt, _ = reactor.simulate(feed, end, n_points=2000).optimum(s)
         res = reactor.simulate(feed, Vopt)
-        rep.summary.append(f"Optimum for {s}: V = {fmt_volume(Vopt)[2:]}")
+        rep.summary.append(f"Optimum for {s}: {size_name} = {fmt_size(Vopt)}")
     elif mode == "Size":
         res = reactor.size(feed, _X(X), _key(rs, key))
     else:
-        res = reactor.simulate(feed, quantity(_required(V, "Volume"), "m^3", "L"))
-    rep.summary.insert(0, f"{kind}: V = {fmt_volume(res.end)[2:]}, τ = {res.end / feed.v / 60:.4g} min")
+        res = reactor.simulate(feed, quantity(_required(V, "Weight W" if pbr else "Volume"), size_si, size_unit))
+    head = f"{kind}: {size_name} = {fmt_size(res.end)}"
+    rep.summary.insert(0, head if pbr else head + f", τ = {res.end / feed.v / 60:.4g} min")
+    if heat is not None:
+        rep.summary.append(f"Outlet T = {res.outlet.T:.4g} K (inlet {feed.T:.4g} K)")
+        rep.summary += _equilibrium_note(rs, heat, feed, res)
+    if "p" in res.extras:
+        rep.summary.append(f"Outlet P = {res.outlet.P / 101325:.4g} atm (P/P0 = {res.extras['p'][-1]:.4g})")
     rep.tables.append(("Outlet", STREAM_HEADERS, _stream_rows(feed, res.outlet, res.species)))
-    if kind == "PFR":
+    if kind != "CSTR":
         for s, Vm, Fm in _maxima(res):
-            rep.summary.append(f"Maximum F_{s} = {Fm * 60:.4g} mol/min at V = {fmt_volume(Vm)[2:]}")
-        C = np.array([[feed.conc(dict(zip(res.species, row)))[s] for s in res.species] for row in res.n])
-        rep.plots.append(("Concentration profile", res.axis * 1000,
-                          {s: C[:, i] / 1000 for i, s in enumerate(res.species)}, "V [L]", "C [mol/L]"))
+            rep.summary.append(f"Maximum F_{s} = {Fm * 60:.4g} mol/min at {size_name} = {fmt_size(Vm)}")
+        x = res.axis if pbr else res.axis * 1000
+        xl = "W [kg]" if pbr else "V [L]"
+        C = _gas_conc(feed, res)
+        rep.plots.append(("Concentration profile", x, {s: C[:, i] / 1000 for i, s in enumerate(res.species)},
+                          xl, "C [mol/L]"))
+        if "T" in res.extras:
+            rep.plots.append(("Temperature profile", x, {"T": res.extras["T"]}, xl, "T [K]"))
+        if "p" in res.extras:
+            rep.plots.append(("Pressure ratio", x, {"P/P0": res.extras["p"]}, xl, "P/P0"))
+    return rep
+
+
+def _cstr_states(rep: Report, reactor: CSTR, feed: Stream, V: float, key: str) -> Report:
+    ss = reactor.steady_states(feed, V)
+    n = len(ss.states)
+    rep.summary.insert(0, f"CSTR: V = {fmt_volume(V)[2:]}, τ = {V / feed.v / 60:.4g} min, "
+                          f"{n} steady state{'s' if n > 1 else ''}")
+    species = ss.states[0].species
+    rows = []
+    for i, (s, stable) in enumerate(zip(ss.states, ss.stable), 1):
+        C = s.outlet.conc()
+        rows.append([str(i), s.outlet.T, s.conversion(key), "stable" if stable else "unstable",
+                     *[C.get(x, 0.0) / 1000 for x in species]])
+    rep.tables.append(("Steady states", ["#", "T [K]", f"X_{key}", "", *[f"C_{x} [mol/L]" for x in species]],
+                       rows))
+    rep.tables.append((f"Outlet, steady state 1 (T = {ss.states[0].outlet.T:.4g} K)", STREAM_HEADERS,
+                       _stream_rows(feed, ss.states[0].outlet, species)))
+    F0 = feed.F[key]
+    ok = np.isfinite(ss.G)
+    rep.plots.append(("Heat generated G(T) and removed R(T)", ss.T[ok],
+                      {"G(T)": ss.G[ok] / F0 / 1000, "R(T)": ss.R[ok] / F0 / 1000}, "T [K]",
+                      f"kJ per mol {key} fed"))
+    if n > 1:
+        rep.summary.append("Multiple steady states: start-up conditions decide which one is reached")
     return rep
 
 
 def run_batch(mode: str, rs: ReactionSet, V: str, T: str, C0: str, t: str = "", X: str = "",
-              key: str = "") -> Report:
+              key: str = "", heat: Heat | None = None) -> Report:
     V = quantity(_required(V, "Volume"), "m^3", "L")
     T = quantity(_required(T, "Temperature"), "K", "K")
     C0 = amounts(_required(C0, "Initial concentrations"), "mol/m^3", "mol/L")
     rep = Report(resolve(rs, C0))
-    reactor = Batch(rs, V=V)
+    reactor = Batch(rs, V=V, heat=heat)
     if mode == "Size":
         res = reactor.time_to(_X(X), T, _key(rs, key), C0=C0)
     else:
         res = reactor.simulate(quantity(_required(t, "Time"), "s", "min"), T, C0=C0)
     rep.summary.append(f"Batch: t = {res.end / 60:.4g} min, V = {fmt_volume(V)[2:]}")
+    if heat is not None:
+        Tt = res.extras["T"]
+        rep.summary.append(f"Final T = {Tt[-1]:.4g} K (initial {T:.4g} K, max {Tt.max():.4g} K)")
     rows = []
     for s in res.species:
         N0, N = res.n0[s], res.profile(s)[-1]
@@ -220,6 +396,58 @@ def run_batch(mode: str, rs: ReactionSet, V: str, T: str, C0: str, t: str = "", 
     rep.tables.append(("Final state", ["Species", "C0 [mol/L]", "C [mol/L]", "N0 [mol]", "N [mol]", "X"], rows))
     for s, tm, Nm in _maxima(res):
         rep.summary.append(f"Maximum C_{s} = {Nm / V / 1000:.4g} mol/L at t = {tm / 60:.4g} min")
+    rep.plots.append(("Concentration vs time", res.axis / 60,
+                      {s: res.profile(s) / V / 1000 for s in res.species}, "t [min]", "C [mol/L]"))
+    if heat is not None:
+        rep.plots.append(("Temperature vs time", res.axis / 60, {"T": res.extras["T"]}, "t [min]", "T [K]"))
+    return rep
+
+
+# Transient reactors
+
+def run_semibatch(rs: ReactionSet, V0: str, T: str, C0: str, v0: str, C_feed: str, t: str) -> Report:
+    V0 = _q(V0, "Initial volume V0", "m^3", "L")
+    C0 = amounts(C0, "mol/m^3", "mol/L") if C0.strip() else {}
+    Cf = amounts(_required(C_feed, "Feed concentrations"), "mol/m^3", "mol/L")
+    rep = Report(resolve(rs, {s: C0.get(s, 0.0) + Cf.get(s, 0.0) for s in set(C0) | set(Cf)}))
+    res = Semibatch(rs, V0, _q(T, "Temperature", "K", "K")).simulate(
+        _q(t, "Time", "s", "min"), C0, _q(v0, "Feed v0", "m^3/s", "L/min"), Cf)
+    Vt = res.extras["V"]
+    rep.summary.insert(0, f"Semibatch: t = {res.end / 60:.4g} min, V = {fmt_volume(V0)[2:]} → {fmt_volume(Vt[-1])[2:]}")
+    rows = []
+    for s in res.species:
+        N0, N = res.n0[s], res.profile(s)[-1]
+        X = (N0 - N) / N0 if N0 > 0 and N < N0 and s not in Cf else None
+        rows.append([s, N0 / V0 / 1000, N / Vt[-1] / 1000, N0, N, X])
+    rep.tables.append(("Final state", ["Species", "C0 [mol/L]", "C [mol/L]", "N0 [mol]", "N [mol]", "X"], rows))
+    C = res.n / Vt[:, None] / 1000
+    for i, s in enumerate(res.species):
+        k = int(np.argmax(C[:, i]))
+        if 0 < k < len(C) - 1:
+            rep.summary.append(f"Maximum C_{s} = {C[k, i]:.4g} mol/L at t = {res.axis[k] / 60:.4g} min")
+    rep.plots.append(("Concentration vs time", res.axis / 60, {s: C[:, i] for i, s in enumerate(res.species)},
+                      "t [min]", "C [mol/L]"))
+    return rep
+
+
+def run_startup(rs: ReactionSet, V: str, feed: Stream, C_init: str, t: str, key: str = "",
+                fraction: str = "") -> Report:
+    rep = Report(resolve(rs, feed.F))
+    Ci = amounts(C_init, "mol/m^3", "mol/L") if C_init.strip() else {}
+    f = float(fraction) if fraction.strip() else 0.99
+    if not 0 < f < 1:
+        raise ValueError("Fraction must be between 0 and 1")
+    k = _key(rs, key)
+    V = _q(V, "Volume", "m^3", "L")
+    st = CSTRStartup(rs, V).simulate(feed, _q(t, "Time", "s", "min"), Ci, k, f)
+    rep.summary.insert(0, f"CSTR start-up: V = {fmt_volume(V)[2:]}, τ = {V / feed.v0 / 60:.4g} min")
+    if np.isfinite(st.t):
+        rep.summary.append(f"t_s = {st.t / 60:.4g} min for C_{k} to cover {f:.0%} of the way to steady state")
+    res = st.result
+    Css = st.steady.outlet.conc()
+    rows = [[s, res.n0[s] / V / 1000, res.profile(s)[-1] / V / 1000, Css.get(s, 0.0) / 1000] for s in res.species]
+    rep.tables.append((f"At t = {res.end / 60:.4g} min", ["Species", "C(0) [mol/L]", "C(t) [mol/L]",
+                                                           "C steady [mol/L]"], rows))
     rep.plots.append(("Concentration vs time", res.axis / 60,
                       {s: res.profile(s) / V / 1000 for s in res.species}, "t [min]", "C [mol/L]"))
     return rep
