@@ -12,6 +12,11 @@ from ..nonideal import (RTD, bypass_dead, dispersion, fit_bypass_dead, fit_inter
 from ..reactors import CSTR, PFR, Batch, Result, Stream
 from ..units import to_si
 from .netexpr import FeedSpec, build, parse, to_text, walk
+from ..diffusion.packed_bed import PackedBed
+from ..diffusion.pellet import (effectiveness, eta_first_order, mears, radius_for_eta, two_pellets,
+                                weisz_prater)
+from ..diffusion.transport import (bed_area, colburn, cylinder_dp, effective_diffusivity, frossling,
+                                   mt_limited_conversion, thoenes_kramers)
 from .parsing import K_unit, amounts, k_unit, mapping, orders, quantity, series
 
 MODELS = ["Power law", "Reversible", "Michaelis-Menten", "Expression"]
@@ -49,6 +54,7 @@ class ReactionSpec:
     basis: str = "C"
     expr: str = ""
     params: str = ""
+    catalytic: bool = False
 
 
 def _elementary(nu: dict, sign: int) -> dict[str, float]:
@@ -79,17 +85,18 @@ def build_reaction(spec: ReactionSpec) -> Reaction:
         rate = Expression(_required(spec.expr, "Rate expression"), **params)
     elif spec.model == "Michaelis-Menten":
         substrate = ref or reactants[0]
-        rate = MichaelisMenten(quantity(_required(spec.k, "Vmax"), "mol/m^3/s", "mol/L/min"),
+        rate = MichaelisMenten(quantity(_required(spec.k, "Vmax"), "mol/kg/s" if spec.catalytic else "mol/m^3/s",
+                                        None if spec.catalytic else "mol/L/min"),
                                quantity(_required(spec.K, "Km"), "mol/m^3", "mol/L"), substrate)
     else:
         of = orders(spec.orders) if spec.orders.strip() else _elementary(nu, -1)
         if spec.model == "Reversible" or reversible:
             orr = orders(spec.reverse_orders) if spec.reverse_orders.strip() else _elementary(nu, 1)
             K = quantity(_required(spec.K, f"K of {eq}"), K_unit(of, orr, spec.basis))
-            rate = Reversible(_k(spec, k_unit(sum(of.values()), spec.basis)), of, orr, K, spec.basis)
+            rate = Reversible(_k(spec, k_unit(sum(of.values()), spec.basis, spec.catalytic)), of, orr, K, spec.basis)
         else:
-            rate = PowerLaw(_k(spec, k_unit(sum(of.values()), spec.basis)), of, spec.basis)
-    return Reaction(eq, rate, ref=ref)
+            rate = PowerLaw(_k(spec, k_unit(sum(of.values()), spec.basis, spec.catalytic)), of, spec.basis)
+    return Reaction(eq, rate, ref=ref, catalytic=spec.catalytic)
 
 
 def build_reactions(specs: list[ReactionSpec]) -> ReactionSet:
@@ -381,4 +388,129 @@ def run_two_param(model: str, tau: str, alpha: float, beta: float, rs: ReactionS
         rep.tables.append((f"Conversion of {rs.reactions[0].ref} (τ = {tau_s / 60:.4g} min)", ["Case", "X"],
                            two_param_conversion(model, rs, C0, quantity(_required(T, "Temperature"), "K", "K"),
                                                 tau_s, alpha, beta)))
+    return rep
+
+
+# Diffusion
+
+GEOMETRIES = ["sphere", "cylinder", "slab"]
+CORRELATIONS = ["Thoenes-Kramers (packed bed)", "Frössling (single sphere)", "Colburn JD (packed bed)"]
+
+
+def _q(text: str, name: str, si: str, default: str | None = None) -> float:
+    return quantity(_required(text, name), si, default)
+
+
+def _opt(text: str, si: str, default: str | None = None) -> float | None:
+    return quantity(text, si, default) if text.strip() else None
+
+
+def effective_De(De: str, DAB: str = "", porosity: str = "", constriction: str = "", tortuosity: str = "") -> float:
+    if De.strip():
+        return quantity(De, "m^2/s", "m^2/s")
+    return effective_diffusivity(_q(DAB, "DAB (or De)", "m^2/s", "m^2/s"), float(_required(porosity, "Pellet porosity")),
+                                 float(_required(constriction, "Constriction σc")),
+                                 float(_required(tortuosity, "Tortuosity τ")))
+
+
+def run_pellet(rs: ReactionSet, Cs: str, T: str, R: str, De: float, rho_c: str = "",
+               geometry: str = "sphere") -> Report:
+    rx = rs.reactions[0]
+    if len(rs.reactions) > 1:
+        raise ValueError("Pellet calculation takes a single reaction")
+    rho = _opt(rho_c, "kg/m^3", "kg/m^3")
+    if rx.catalytic and rho is None:
+        raise ValueError("Rate per catalyst mass needs the pellet density ρc")
+    Cs = amounts(_required(Cs, "Surface concentrations"), "mol/m^3", "mol/L")
+    rep = Report(resolve(rs, Cs))
+    e = effectiveness(rx, Cs, _q(T, "Temperature", "K", "K"), _q(R, "Pellet radius", "m", "m"), De, rho, geometry)
+    rows = [["Thiele modulus φ (at Cs)", e.phi], ["η numerical (exact)", e.eta],
+            [f"η first-order formula ({geometry})", eta_first_order(e.phi, geometry)],
+            ["η large-φ, 1st order: 3/φ" if geometry == "sphere" else "", 3 / e.phi if geometry == "sphere" else None],
+            ["η·φ² = Weisz-Prater C_WP", e.eta * e.phi ** 2]]
+    rep.tables.append(("Internal diffusion", ["Quantity", "Value"], [r for r in rows if r[0]]))
+    verdict = "no internal diffusion limitation" if e.eta * e.phi ** 2 < 1 else "internal diffusion limits the rate"
+    rep.summary.append(f"C_WP = {e.eta * e.phi ** 2:.4g}: {verdict}")
+    R_m = _q(R, "Pellet radius", "m", "m")
+    rep.plots.append((f"{rx.ref} inside the pellet", e.xi * R_m * 1000, {rx.ref: e.C / 1000},
+                      "r [mm]", "C [mol/L]"))
+    return rep
+
+
+def run_criteria(r_obs: str, rho_c: str, rho_b: str, R: str, De: float | None, Cs: str, Cb: str, n: str,
+                 kc: str) -> Report:
+    r = _q(r_obs, "Observed rate -r'A", "mol/kg/s", "mol/kg/s")
+    R_m = _q(R, "Pellet radius", "m", "m")
+    rows, rep = [], Report()
+    if De is not None and rho_c.strip() and Cs.strip():
+        cwp = weisz_prater(r, _q(rho_c, "ρc", "kg/m^3", "kg/m^3"), R_m, De, _q(Cs, "Cs", "mol/m^3", "mol/L"))
+        rows.append(["Weisz-Prater C_WP", cwp, "≪ 1: no internal limitation; ≫ 1: limited"])
+        rep.summary.append(f"C_WP = {cwp:.4g}: " + ("internal diffusion limits" if cwp > 1 else "no internal limitation"))
+    if rho_b.strip() and kc.strip() and Cb.strip():
+        mr = mears(r, _q(rho_b, "ρb", "kg/m^3", "kg/m^3"), R_m, float(n or 1), _q(kc, "kc", "m/s", "m/s"),
+                   _q(Cb, "Cb", "mol/m^3", "mol/L"))
+        rows.append(["Mears MR", mr, "< 0.15: external transfer negligible"])
+        rep.summary.append(f"MR = {mr:.4g}: " + ("external mass transfer limits" if mr >= 0.15 else "external transfer negligible"))
+    if not rows:
+        raise ValueError("Fill De, ρc and Cs (Weisz-Prater) and/or ρb, kc and Cb (Mears)")
+    rep.tables.append(("Criteria", ["Criterion", "Value", "Meaning"], rows))
+    return rep
+
+
+def run_mass_transfer(correlation: str, U: str, dp: str, nu: str, DAB: str, porosity: str = "",
+                      gamma: str = "", cyl_D: str = "", cyl_L: str = "", L: str = "") -> Report:
+    rep = Report()
+    if cyl_D.strip() or cyl_L.strip():
+        dp_m, g = cylinder_dp(_q(cyl_D, "Cylinder D", "m", "m"), _q(cyl_L, "Cylinder L", "m", "m"))
+        rep.summary.append(f"Cylinder: equivalent dp = {dp_m:.4g} m, shape factor γ = {g:.4g}")
+    else:
+        dp_m, g = _q(dp, "Particle diameter dp", "m", "m"), None
+    gamma = float(gamma) if gamma.strip() else (g or 1.0)
+    args = (_q(U, "Velocity U", "m/s", "m/s"), dp_m, _q(nu, "Kinematic viscosity ν", "m^2/s", "m^2/s"),
+            _q(DAB, "DAB", "m^2/s", "m^2/s"))
+    if correlation.startswith("Frössling"):
+        mt = frossling(*args)
+    else:
+        eps = float(_required(porosity, "Bed porosity"))
+        mt = thoenes_kramers(*args, eps, gamma) if correlation.startswith("Thoenes") else colburn(*args, eps)
+    rows = [["Re" + ("′" if correlation.startswith("Thoenes") else ""), mt.Re], ["Sc", mt.Sc],
+            ["Sh" + ("′" if correlation.startswith("Thoenes") else ""), mt.Sh], ["kc [m/s]", mt.kc]]
+    if porosity.strip():
+        ac = bed_area(dp_m, float(porosity))
+        rows.append(["ac = 6(1−φ)/dp [m²/m³]", ac])
+        if L.strip():
+            X = mt_limited_conversion(mt.kc, ac, _q(L, "Bed length", "m", "m"), args[0])
+            rows.append(["X if mass-transfer limited", X])
+    rep.tables.append((correlation, ["Quantity", "Value"], rows))
+    return rep
+
+
+def run_two_pellets(r1: str, R1: str, r2: str, R2: str, eta_target: str = "") -> Report:
+    tp = two_pellets(float(_required(r1, "Rate 1")), _q(R1, "R1", "m", "m"), float(_required(r2, "Rate 2")),
+                     _q(R2, "R2", "m", "m"))
+    rows = [["Pellet 1", tp.phi1, tp.eta1, 3 / tp.phi1], ["Pellet 2", tp.phi2, tp.eta2, 3 / tp.phi2]]
+    rep = Report(tables=[("Two pellet sizes (1st order, sphere)", ["", "φ", "η exact", "3/φ (large φ)"], rows)])
+    if eta_target.strip():
+        Rn = radius_for_eta(float(eta_target), tp.phi1, _q(R1, "R1", "m", "m"))
+        rep.summary.append(f"Radius for η = {float(eta_target):.3g}: R = {Rn:.4g} m ({Rn * 1000:.4g} mm)")
+    return rep
+
+
+def run_packed_bed(rs: ReactionSet, feed: Stream, mode: str, target: str, R: str, De: float, rho_c: str,
+                   rho_b: str, kc: str, ac: str, geometry: str = "sphere") -> Report:
+    if len(rs.reactions) > 1:
+        raise ValueError("Packed bed with diffusion takes a single reaction")
+    rx = rs.reactions[0]
+    rep = Report(resolve(rs, feed.F))
+    bed = PackedBed(rx, _q(R, "Pellet radius", "m", "m"), De, _q(rho_c, "ρc", "kg/m^3", "kg/m^3"),
+                    _q(rho_b, "ρb", "kg/m^3", "kg/m^3"), _q(kc, "kc", "m/s", "m/s"), _q(ac, "ac", "1/m", "1/m"),
+                    geometry)
+    res = bed.size(feed, _X(target)) if mode == "Size" else bed.simulate(feed, _q(target, "W", "kg", "kg"))
+    rep.summary.insert(0, f"W = {res.end:.4g} kg ({res.end * 1000:.4g} g), X_{res.key} = {res.X[-1]:.4g}")
+    rep.summary.append("Constant v0 (liquid or dilute gas); equal kc and De for all species")
+    idx = np.unique(np.linspace(0, len(res.W) - 1, 8).astype(int))
+    rows = [[res.W[i] * 1000, res.X[i], res.Cb[i] / 1000, res.Cs[i] / 1000, res.eta[i], res.Omega[i]] for i in idx]
+    rep.tables.append(("Along the bed", ["W [g]", "X", "Cb [mol/L]", "Cs [mol/L]", "η", "Ω"], rows))
+    rep.plots.append(("Conversion along the bed", res.W * 1000, {"X": res.X}, "W [g]", "X"))
+    rep.plots.append(("Effectiveness along the bed", res.W * 1000, {"η": res.eta, "Ω": res.Omega}, "W [g]", "-"))
     return rep

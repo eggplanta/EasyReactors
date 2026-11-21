@@ -4,9 +4,12 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Button, Input, Select, Static, TextArea
 
-from .compute import (METHODS, RTD_KINDS, TWO_PARAM, ReactionSpec, Report, build_reactions, build_rtd,
-                      fit_two_param, rtd_report, run_batch, run_flow_reactor, run_network, run_rtd_models,
-                      run_two_param)
+from dataclasses import replace
+
+from .compute import (CORRELATIONS, GEOMETRIES, METHODS, RTD_KINDS, TWO_PARAM, ReactionSpec, Report,
+                      build_reactions, build_rtd, effective_De, fit_two_param, rtd_report, run_batch, run_criteria,
+                      run_flow_reactor, run_mass_transfer, run_network, run_packed_bed, run_pellet, run_rtd_models,
+                      run_two_param, run_two_pellets)
 from .parsing import table_file
 from .widgets import FeedEditor, ReactionsEditor, ResultsView, area, box, inp, options, row, sel, value
 
@@ -311,3 +314,149 @@ class TwoParamPane(Pane):
             [ReactionSpec("A + B > C + D", ref="A", k="0.28 m3/(kmol*min)")])
         self.fill(model=list(TWO_PARAM)[0], source="Fit", tau="10", unit="min", C0step="2000",
                   data="4 8 10 14 16 18\n1000 1333 1500 1666 1750 1800", T="300", C0="A=2, B=2")
+
+
+# Diffusion
+
+CALCS = {
+    "Pellet: Thiele modulus and η": ("pellet", "kin"),
+    "Criteria: Weisz-Prater and Mears": ("pellet", "crit"),
+    "External mass transfer (kc)": ("mt",),
+    "Two pellet sizes (find φ, η, R)": ("two",),
+    "Packed bed with diffusion (Ω, W)": ("pellet", "kin", "bed", "feed"),
+}
+DESC = {
+    "Pellet: Thiele modulus and η": "Numerical η for any rate law (exact), compared with the book formulas.",
+    "Criteria: Weisz-Prater and Mears": "From an observed rate: C_WP ≫ 1 → internal limitation; MR > 0.15 → external.",
+    "External mass transfer (kc)": "Re, Sc, Sh, kc and ac from a correlation; X if the bed is mass-transfer limited.",
+    "Two pellet sizes (find φ, η, R)": "1st order, sphere: two observed rates at two radii give φ and η (Fogler 15-2).",
+    "Packed bed with diffusion (Ω, W)": "Single reaction, external + internal resistance along the bed (Fogler 15-3).",
+}
+NO_RATE = "4.42e-10*530 m3/(g*s)"
+
+
+class DiffusionPane(Pane):
+    def form(self):
+        names = list(CALCS)
+        yield box("Calculation", row("Calculation", sel(options(names), value=names[0], allow_blank=False, id="calc")),
+                  Static(DESC[names[0]], id="desc", classes="hint"))
+        yield box("Pellet",
+                  row("Geometry", sel(options(GEOMETRIES), value="sphere", allow_blank=False, id="geom")),
+                  row("R", inp(placeholder="[m] radius (slab: half thickness), e.g. 3 mm", id="pR")),
+                  row("De", inp(placeholder="[m²/s] effective diffusivity (blank = from DAB below)", id="pDe")),
+                  row("DAB", inp(placeholder="[m²/s] to compute De = DAB·φp·σc/τ", id="pDAB"), "r-pDAB"),
+                  row("φp, σc, τ", Horizontal(inp(placeholder="porosity", id="pphi"),
+                                              inp(placeholder="constriction", id="psig"),
+                                              inp(placeholder="tortuosity", id="ptau"), classes="multi"), "r-ptri"),
+                  row("ρc", inp(placeholder="[kg/m³] pellet density, e.g. 2.8 g/cm3", id="prho")),
+                  row("Rate per", sel([("Pellet volume (k)", "volume"), ("Catalyst mass (k′)", "mass")],
+                                      value="mass", allow_blank=False, id="pbasis"), "r-pbasis"),
+                  id="b-pellet")
+        yield box("Kinetics", ReactionsEditor(),
+                  row("T", inp("300", placeholder="[K]", id="kT"), "r-kT"),
+                  row("Cs", inp(placeholder="surface concentrations, A=0.2  [mol/L]", id="kCs"), "r-kCs"),
+                  id="b-kin")
+        yield box("Criteria",
+                  row("−r′A obs", inp(placeholder="[mol/kg/s] observed rate", id="crr")),
+                  row("Cs", inp(placeholder="surface concentration [mol/L] (Weisz-Prater)", id="crCs")),
+                  row("Cb", inp(placeholder="bulk concentration [mol/L] (Mears)", id="crCb")),
+                  row("n", inp("1", placeholder="reaction order", id="crn")),
+                  row("kc", inp(placeholder="[m/s]", id="crkc")),
+                  row("ρb", inp(placeholder="[kg/m³] bed bulk density", id="crrhob")),
+                  id="b-crit")
+        yield box("External mass transfer",
+                  row("Correlation", sel(options(CORRELATIONS), value=CORRELATIONS[0], allow_blank=False, id="mcorr")),
+                  row("U", inp(placeholder="[m/s] superficial velocity", id="mU")),
+                  row("dp", inp(placeholder="[m] particle diameter", id="mdp")),
+                  row("Cylinder D, L", Horizontal(inp(placeholder="D (instead of dp)", id="mD"),
+                                                  inp(placeholder="L", id="mL"), classes="multi")),
+                  row("ν", inp(placeholder="[m²/s] kinematic viscosity, e.g. 0.5 cSt", id="mnu")),
+                  row("DAB", inp(placeholder="[m²/s]", id="mDAB")),
+                  row("Bed porosity", inp(placeholder="φ (packed bed)", id="meps")),
+                  row("γ", inp(placeholder="shape factor (blank = 1 or from cylinder)", id="mgam")),
+                  row("Bed length", inp(placeholder="[m] for mass-transfer-limited X", id="mLb")),
+                  id="b-mt")
+        yield box("Two pellet sizes",
+                  row("Pellet 1", Horizontal(inp(placeholder="observed rate", id="tr1"),
+                                             inp(placeholder="R1 [m]", id="tR1"), classes="multi")),
+                  row("Pellet 2", Horizontal(inp(placeholder="observed rate", id="tr2"),
+                                             inp(placeholder="R2 [m]", id="tR2"), classes="multi")),
+                  row("Target η", inp(placeholder="e.g. 0.95 → radius needed", id="teta")),
+                  id="b-two")
+        yield box("Packed bed",
+                  row("Problem", sel([("Size: W for a target X", "Size"), ("Simulate: X for a given W", "Simulate")],
+                                     value="Size", allow_blank=False, id="bmode")),
+                  row("X or W", inp(placeholder="0.998  or  450 g", id="btarget")),
+                  row("ρb", inp(placeholder="[kg/m³] bed bulk density", id="brhob")),
+                  row("kc", inp(placeholder="[m/s] (use External mass transfer to get it)", id="bkc")),
+                  row("ac", inp(placeholder="[m²/m³] = 6(1−φ)/dp", id="bac")),
+                  id="b-bed")
+        yield box("Feed", FeedEditor(), id="b-feed")
+
+    def on_mount(self) -> None:
+        self.refresh_fields()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "calc":
+            self.refresh_fields()
+
+    def refresh_fields(self) -> None:
+        calc = value(self, "#calc")
+        shown = CALCS[calc]
+        for b in ("pellet", "kin", "crit", "mt", "two", "bed", "feed"):
+            self.query_one(f"#b-{b}").display = b in shown
+        self.query_one("#desc", Static).update(DESC[calc])
+        bed = "bed" in shown
+        self.query_one("#r-kT").display = self.query_one("#r-kCs").display = not bed
+        self.query_one("#r-pbasis").display = "kin" in shown
+
+    def _specs(self) -> list[ReactionSpec]:
+        catalytic = value(self, "#pbasis") == "mass"
+        return [replace(s, catalytic=catalytic) for s in self.specs()]
+
+    def _De(self) -> float:
+        return effective_De(*(value(self, f"#{k}") for k in ("pDe", "pDAB", "pphi", "psig", "ptau")))
+
+    def job(self):
+        calc = value(self, "#calc")
+        v = lambda k: value(self, f"#{k}")
+        if calc.startswith("Pellet"):
+            specs, De = self._specs(), self._De()
+            return lambda: run_pellet(build_reactions(specs), v("kCs"), v("kT"), v("pR"), De,
+                                      v("prho") if value(self, "#pbasis") == "mass" else "", v("geom"))
+        if calc.startswith("Criteria"):
+            De = self._De() if (v("pDe") or v("pDAB")) else None
+            args = (v("crr"), v("prho"), v("crrhob"), v("pR"), De, v("crCs"), v("crCb"), v("crn"), v("crkc"))
+            return lambda: run_criteria(*args)
+        if calc.startswith("External"):
+            args = [v(k) for k in ("mcorr", "mU", "mdp", "mnu", "mDAB", "meps", "mgam", "mD", "mL", "mLb")]
+            return lambda: run_mass_transfer(*args)
+        if calc.startswith("Two"):
+            args = [v(k) for k in ("tr1", "tR1", "tr2", "tR2", "teta")]
+            return lambda: run_two_pellets(*args)
+        specs, De = self._specs(), self._De()
+        if not any(s.catalytic for s in specs):
+            raise ValueError("Packed bed: set 'Rate per' to catalyst mass (k′)")
+        feed = self.query_one(FeedEditor).stream()
+        args = (v("bmode"), v("btarget"), v("pR"), De, v("prho"), v("brhob"), v("bkc"), v("bac"), v("geom"))
+        return lambda: run_packed_bed(build_reactions(specs), feed, *args)
+
+    async def example(self) -> None:
+        calc = value(self, "#calc")
+        no = [ReactionSpec("NO > P", k=NO_RATE)]
+        pellet = dict(geom="sphere", pR="3 mm", pDe="1.82e-8", prho="2.8 g/cm3", pbasis="mass")
+        if calc.startswith("Pellet"):
+            await self.query_one(ReactionsEditor).load(no)
+            self.fill(**pellet, kT="1173", kCs="NO=2.08e-4")
+        elif calc.startswith("Criteria"):
+            self.fill(**pellet, crr="2.872e-6", crCs="7.64e-5", crCb="2.078e-4", crn="1", crkc="6e-5",
+                      crrhob="1.4 g/cm3")
+        elif calc.startswith("External"):
+            self.fill(mcorr=CORRELATIONS[0], mU="150", mdp="", mD="0.25 cm", mL="0.5 cm", mnu="4.94e-5",
+                      mDAB="0.69e-4*2.06", meps="0.4", mgam="", mLb="0.05")
+        elif calc.startswith("Two"):
+            self.fill(tr1="3e-5", tR1="0.01", tr2="15e-5", tR2="0.001", teta="0.95")
+        else:
+            await self.query_one(ReactionsEditor).load(no)
+            self.fill(**pellet, bmode="Size", btarget="0.998", brhob="1.4 g/cm3", bkc="6e-5", bac="500",
+                      phase="Liquid", T="1173", v0="1e-6 m3/s", comp="NO=2.078e-4")

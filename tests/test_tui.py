@@ -162,7 +162,7 @@ def test_app_examples_run():
         app = EasyReactors()
         out = {}
         async with app.run_test(size=(160, 50)) as pilot:
-            for tab in ("tab-reactor", "tab-network", "tab-rtd", "tab-two"):
+            for tab in ("tab-reactor", "tab-network", "tab-rtd", "tab-two", "tab-diff"):
                 app.query_one(TabbedContent).active = tab
                 await pilot.pause()
                 await app.action_example()
@@ -179,3 +179,30 @@ def test_app_examples_run():
     assert out["tab-network"][1] == "3.02 m3"
     assert out["tab-rtd"][1] == "37.25"
     assert out["tab-two"][1] == "0.7017"
+    assert out["tab-diff"] == ["Thiele modulus φ (at Cs)", "18.01"]
+
+
+# Diffusion forms, Fogler 15-3 and 14-2
+
+def test_diffusion_forms_fogler():
+    from easyreactors.tui.compute import (CORRELATIONS, effective_De, run_criteria, run_mass_transfer,
+                                         run_packed_bed, run_pellet)
+    assert quantity("4.42e-10*530 m3/(g*s)", "m^3/kg/s") == pytest.approx(2.3426e-4)
+    rs = build_reactions([ReactionSpec("NO > P", k="4.42e-10*530 m3/(g*s)", catalytic=True)])
+    De = effective_De("1.82e-8")
+    pellet = dict(run_pellet(rs, "NO=2e-4", "1173", "3 mm", De, "2.8 g/cm3").tables[0][2])
+    assert pellet["Thiele modulus φ (at Cs)"] == pytest.approx(18, rel=1e-3)
+    mt = dict(run_mass_transfer(CORRELATIONS[0], "150", "", "4.94e-5", "0.69e-4*2.06", "0.4",
+                                cyl_D="0.25 cm", cyl_L="0.5 cm", L="0.05").tables[0][2])
+    assert mt["kc [m/s]"] == pytest.approx(6.15, rel=2e-3)
+    assert mt["X if mass-transfer limited"] == pytest.approx(0.87, abs=0.002)
+    crit = run_criteria("2.872e-6", "2.8 g/cm3", "1.4 g/cm3", "3 mm", De, "", "2.078e-4", "1", "6e-5")
+    assert dict((r[0], r[1]) for r in crit.tables[0][2])["Mears MR"] == pytest.approx(0.97, abs=0.01)
+    feed = build_feed("Liquid", "1173", "", "1e-6 m3/s", "NO=2.078e-4")
+    bed = run_packed_bed(rs, feed, "Size", "0.998", "3 mm", De, "2.8 g/cm3", "1.4 g/cm3", "6e-5", "500")
+    assert bed.summary[0].startswith("W = 0.4586 kg")
+
+
+def test_quantity_accepts_numeric_products():
+    assert quantity("1/3 h", "s") == pytest.approx(1200)
+    assert quantity("5 1/min", "1/s") == pytest.approx(5 / 60)

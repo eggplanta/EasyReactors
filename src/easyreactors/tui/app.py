@@ -2,7 +2,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Footer, Header, TabbedContent, TabPane
 
-from .panes import NetworkPane, Pane, ReactorPane, RTDPane, TwoParamPane
+from .panes import DiffusionPane, NetworkPane, Pane, ReactorPane, RTDPane, TwoParamPane
 
 CSS = """
 Screen { background: $surface; }
@@ -16,6 +16,8 @@ ResultsView { width: 1fr; padding: 0 1; border-left: tall $primary 30%; }
 .lbl { width: 15; padding: 0 1 0 0; color: $text-muted; }
 .row Input, .row Select, .row TextArea { width: 1fr; }
 .row #path { width: 1fr; }
+.multi { height: auto; width: 1fr; }
+.multi Input { width: 1fr; margin-right: 1; }
 TextArea { height: 6; margin: 0 0 1 0; }
 TextArea.short { height: 4; }
 .small { min-width: 8; margin: 0 1 1 0; }
@@ -49,6 +51,8 @@ class EasyReactors(App):
                 yield RTDPane()
             with TabPane("Two-parameter models", id="tab-two"):
                 yield TwoParamPane()
+            with TabPane("Diffusion", id="tab-diff"):
+                yield DiffusionPane()
         yield Footer()
 
     def pane(self) -> Pane:

@@ -6,7 +6,16 @@ import pint
 
 from ..units import Q_
 
-_NUMBER = re.compile(r"^\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*(.*?)\s*$")
+_NUM = r"(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+_NUMBER = re.compile(rf"^\s*([-+]?{_NUM}(?:\s*[*/]\s*{_NUM})*)\s*(.*?)\s*$")
+
+
+def _product(text: str) -> float:
+    parts = re.split(r"\s*([*/])\s*", text)
+    x = float(parts[0])
+    for op, v in zip(parts[1::2], parts[2::2]):
+        x = x * float(v) if op == "*" else x / float(v)
+    return x
 
 
 def quantity(text: str, si_unit: str, default_unit: str | None = None) -> float:
@@ -15,7 +24,7 @@ def quantity(text: str, si_unit: str, default_unit: str | None = None) -> float:
         raise ValueError(f"Not a number with units: '{text}'")
     unit = re.sub(r"([A-Za-z])(-?\d+(?:\.\d+)?)", r"\1**\2", m[2]) or default_unit or si_unit
     try:
-        return float(Q_(float(m[1]), unit).to(si_unit).magnitude)
+        return float(Q_(_product(m[1]), unit).to(si_unit).magnitude)
     except pint.DimensionalityError:
         raise ValueError(f"Wrong units '{m[2] or unit}', expected something like {default_unit or si_unit}")
     except Exception:
@@ -91,8 +100,9 @@ def _drive(n: float, basis: str) -> str:
     return f"({drive})**({n:g})" if n else "dimensionless"
 
 
-def k_unit(order: float, basis: str = "C") -> str:
-    return f"mol/m^3/s/{_drive(order, basis)}" if order else "mol/m^3/s"
+def k_unit(order: float, basis: str = "C", per_mass: bool = False) -> str:
+    rate = "mol/kg/s" if per_mass else "mol/m^3/s"
+    return f"{rate}/{_drive(order, basis)}" if order else rate
 
 
 def K_unit(orders_f: dict, orders_r: dict, basis: str = "C") -> str:
