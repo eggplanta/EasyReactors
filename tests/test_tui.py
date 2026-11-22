@@ -175,7 +175,7 @@ def test_app_examples_run():
         app = EasyReactors()
         out = {}
         async with app.run_test(size=(160, 50)) as pilot:
-            for tab in ("tab-reactor", "tab-network", "tab-trans", "tab-rtd", "tab-two", "tab-diff"):
+            for tab in ("tab-reactor", "tab-network", "tab-trans", "tab-rtd", "tab-two", "tab-diff", "tab-kin"):
                 app.query_one(TabbedContent).active = tab
                 await pilot.pause()
                 await app.action_example()
@@ -194,6 +194,7 @@ def test_app_examples_run():
     assert out["tab-rtd"][1] == "37.25"
     assert out["tab-two"][1] == "0.7017"
     assert out["tab-diff"] == ["Thiele modulus φ (at Cs)", "18.01"]
+    assert out["tab-kin"][:2] == ["0", "0.05"]
 
 
 # Diffusion forms, Fogler 15-3 and 14-2
@@ -266,3 +267,28 @@ def test_ergun_from_bed_data_fogler_5_4():
                                               rho_c="120 lb/ft^3", mu="0.0673 lb/(ft*h)", rho0="0.413 lb/ft^3"), feed)
     assert alpha == pytest.approx(0.0367, abs=3e-4)
     assert rho_b == pytest.approx(to_si("120 lb/ft^3", "kg/m^3") * 0.55)
+
+
+# Kinetics forms (Fogler 7-1 to 7-4, 3-1)
+
+def test_kinetics_forms_fogler():
+    from easyreactors.tui.compute import KIN_METHODS, run_arrhenius, run_batch_kinetics, run_rate_kinetics
+    from easyreactors.tui.parsing import named_table, table_text
+    data = "t  0 50 100 150 200 250 300\nC  0.05 0.038 0.0306 0.0256 0.0222 0.0195 0.0174"
+    assert table_text(data)[0].tolist() == [0, 50, 100, 150, 200, 250, 300]
+    rep = run_batch_kinetics(data, "min", "mol/L", KIN_METHODS[2])
+    assert rep.summary[0].startswith("Order n = 2, k = 0.1253 L/(mol*min)")
+    assert quantity("0.1253 L/(mol*min)", k_unit(2)) > 0
+    rep = run_batch_kinetics(data, "min", "mol/L", KIN_METHODS[3])
+    assert rep.summary[0].startswith("Order n = 2.045, k = 0.1467")
+    rep = run_batch_kinetics(data, "min", "mol/L", KIN_METHODS[0], order="2")
+    assert rep.summary[0].startswith("Order n = 2, k = 0.1253")
+    rates = "p_CO p_H2 r\n1.0 1.0 5.2e-3\n1.8 1.0 13.2e-3\n4.08 1.0 30.0e-3\n1.0 0.1 4.95e-3\n1.0 0.5 7.42e-3\n1.0 4.0 5.25e-3"
+    assert list(named_table(rates)) == ["p_CO", "p_H2", "r"]
+    rep = run_rate_kinetics(rates, "a*p_CO*p_H2^0.5/(1 + b*p_H2)", "a=0.02, b=2")
+    params = dict(rep.tables[0][2])
+    assert params["a"] == pytest.approx(0.018, abs=5e-4) and params["b"] == pytest.approx(1.49, abs=0.005)
+    with pytest.raises(ValueError, match="Line 2"):
+        named_table("p_A r\n1 2 3")
+    rep = run_arrhenius("T 313 319 323 328 333\nk 0.00043 0.00103 0.00180 0.00355 0.00717", "1/s")
+    assert rep.summary[0].startswith("Ea = 121.5 kJ/mol (Ea/R = 14612 K)")

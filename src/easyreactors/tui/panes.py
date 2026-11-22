@@ -6,7 +6,8 @@ from textual.widgets import Button, Input, Label, Select, Static, TextArea
 
 from dataclasses import replace
 
-from .compute import (CORRELATIONS, GEOMETRIES, METHODS, RTD_KINDS, TWO_PARAM, ReactionSpec, Report,
+from .compute import (CORRELATIONS, GEOMETRIES, KIN_CALCS, KIN_METHODS, METHODS, RTD_KINDS, TWO_PARAM,
+                      ReactionSpec, Report, run_arrhenius, run_batch_kinetics, run_rate_kinetics,
                       build_heat, build_reactions, lookup_properties, run_semibatch, run_startup, build_rtd, effective_De, fit_two_param, rtd_report, run_batch, run_criteria,
                       run_flow_reactor, run_mass_transfer, run_network, run_packed_bed, run_pellet, run_rtd_models,
                       run_two_param, run_two_pellets)
@@ -288,6 +289,99 @@ class TransientPane(Pane):
             await editor.load([ReactionSpec("A + B > C + D", ref="A", k="2.2 L/(mol*s)")])
             self.fill(tV="5", tt="500 s", Cinit="A=0.05", phase="Liquid", T="300", v0="0.05 L/s", comp="B=0.025")
             self.notify("Fogler 6-3: methyl bromide semibatch")
+
+
+# Kinetics from data
+
+KIN_EXAMPLES = {
+    "Batch data C(t): order and k": dict(kdata="t  0 50 100 150 200 250 300\nC  0.05 0.038 0.0306 0.0256 0.0222 0.0195 "
+                                               "0.0174", kt="min", kC="mol/L"),
+    "Rate data: fit a rate law": dict(kdata="p_CO p_H2 r\n1.0 1.0 5.2e-3\n1.8 1.0 13.2e-3\n4.08 1.0 30.0e-3\n"
+                                            "1.0 0.1 4.95e-3\n1.0 0.5 7.42e-3\n1.0 4.0 5.25e-3",
+                                      kexpr="a*p_CO*p_H2^b1/(1 + b*p_H2)", kguess="a=0.02, b1=0.5, b=2"),
+    "Arrhenius: Ea from k(T)": dict(kdata="T  313 319 323 328 333\nk  0.00043 0.00103 0.00180 0.00355 0.00717",
+                                    kku="1/s"),
+}
+KIN_NOTES = {
+    "Batch data C(t): order and k": "Fogler 7-1 to 7-3: trityl + methanol",
+    "Rate data: fit a rate law": "Fogler 7-4: methanation in a differential reactor",
+    "Arrhenius: Ea from k(T)": "Fogler 3-1: benzene diazonium chloride",
+}
+
+
+class KineticsPane(Pane):
+    GUIDE = guides.KINETICS
+
+    def form(self):
+        names = list(KIN_CALCS)
+        yield box("Calculation",
+                  row("Calculation", sel(options(names), value=names[0], allow_blank=False, id="kcalc")),
+                  Static(KIN_CALCS[names[0]], id="kdesc", classes="hint"))
+        yield box("Data",
+                  area(placeholder="t and C as two rows or two columns (labels like 't' and 'C' are ignored)",
+                       id="kdata"),
+                  row("File", Horizontal(inp(placeholder="or a CSV/TXT path", id="kpath"),
+                                         Button("Load", id="kload", compact=True), classes="multi")),
+                  row("Time unit", inp("min", placeholder="unit of t, e.g. min · s · h", id="kt"), "k-t"),
+                  row("Conc. unit", inp("mol/L", placeholder="unit of C, e.g. mol/L", id="kC"), "k-C"),
+                  row("k unit", inp(placeholder="units of k, only for display, e.g. 1/s", id="kku"), "k-ku"))
+        yield box("Method",
+                  row("Method", sel(options(KIN_METHODS), value=KIN_METHODS[0], allow_blank=False, id="kmethod"),
+                      "k-method"),
+                  row("Order", inp(placeholder="blank = fit it · or fix it, e.g. 2 · 1/2", id="korder"), "k-order"),
+                  row("Poly degree", inp(placeholder="3 (polynomial fit only)", id="kdeg"), "k-deg"),
+                  row("-r =", inp(placeholder="blank = power law · e.g. a*p_CO*p_H2^b1/(1 + b*p_H2)", id="kexpr"),
+                      "k-expr"),
+                  row("Guesses", inp(placeholder="initial values of the parameters, e.g. a=0.02, b1=0.5, b=2",
+                                     id="kguess"), "k-guess"),
+                  id="kmethod-box")
+
+    def on_mount(self) -> None:
+        self.refresh_fields()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id in ("kcalc", "kmethod"):
+            self.refresh_fields()
+
+    def refresh_fields(self) -> None:
+        calc, method = value(self, "#kcalc"), value(self, "#kmethod")
+        batch, rate = calc.startswith("Batch"), calc.startswith("Rate")
+        self.query_one("#kdesc", Static).update(KIN_CALCS[calc])
+        self.query_one("#k-t").display = self.query_one("#k-C").display = batch
+        self.query_one("#k-ku").display = calc.startswith("Arrhenius")
+        self.query_one("#kmethod-box").display = not calc.startswith("Arrhenius")
+        self.query_one("#k-method").display = self.query_one("#k-order").display = batch
+        self.query_one("#k-deg").display = batch and "polynomial" in method
+        self.query_one("#k-expr").display = self.query_one("#k-guess").display = rate
+        self.query_one("#kdata", TextArea).placeholder = (
+            "t and C as two rows or two columns (labels like 't' and 'C' are ignored)" if batch else
+            "header with column names, then one row per run:\np_CO  p_H2  r\n1.0   1.0   5.2e-3" if rate else
+            "T [K] and k as two rows or two columns")
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "kload":
+            try:
+                from pathlib import Path
+                self.query_one("#kdata", TextArea).text = Path(value(self, "#kpath")).expanduser().read_text()
+            except Exception as e:
+                await self.results.error(f"Cannot load file: {e}")
+            return
+        await super().on_button_pressed(event)
+
+    def job(self):
+        calc = value(self, "#kcalc")
+        data = self.query_one("#kdata", TextArea).text
+        f = {k: value(self, f"#{k}") for k in ("kt", "kC", "kmethod", "korder", "kdeg", "kexpr", "kguess", "kku")}
+        if calc.startswith("Batch"):
+            return lambda: run_batch_kinetics(data, f["kt"], f["kC"], f["kmethod"], f["korder"], f["kdeg"])
+        if calc.startswith("Rate"):
+            return lambda: run_rate_kinetics(data, f["kexpr"], f["kguess"])
+        return lambda: run_arrhenius(data, f["kku"])
+
+    async def example(self) -> None:
+        calc = value(self, "#kcalc")
+        self.fill(**KIN_EXAMPLES[calc])
+        self.notify(KIN_NOTES[calc])
 
 
 # Network

@@ -2,7 +2,8 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Footer, Header, TabbedContent, TabPane
 
-from .panes import DiffusionPane, NetworkPane, Pane, ReactorPane, RTDPane, TransientPane, TwoParamPane
+from .panes import (DiffusionPane, KineticsPane, NetworkPane, Pane, ReactorPane, RTDPane, TransientPane,
+                    TwoParamPane)
 
 CSS = """
 Screen { background: $surface; }
@@ -66,6 +67,8 @@ class EasyReactors(App):
                 yield TwoParamPane()
             with TabPane("Diffusion", id="tab-diff"):
                 yield DiffusionPane()
+            with TabPane("Kinetics", id="tab-kin"):
+                yield KineticsPane()
         yield Footer()
 
     def pane(self) -> Pane:

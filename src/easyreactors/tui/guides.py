@@ -73,3 +73,17 @@ DIFFUSION = """
 - **Two pellets**: φ and η from rates measured with two pellet sizes.
 - **Packed bed**: catalyst weight with internal and external resistances.
 """ + COMMON
+
+KINETICS = """
+## Kinetics from experimental data
+- **Batch data C(t)**: order and k of -rA = k·CA^n.
+  - *Differential*: -dC/dt by finite differences (Fogler's 3-point formulas) or a polynomial, then ln(-dC/dt) vs ln C.
+  - *Integral*: tests orders 0, 1 and 2 with straight lines; the best R² wins.
+  - *Nonlinear regression*: fits n and k to the integrated law (most accurate).
+  - Leave **Order** blank to fit it, or type it (e.g. `2`) to refit only k.
+- **Rate data**: paste a table with a header (`p_CO p_H2 r`). Columns must be named `C_A` or `p_A`.
+  Leave the expression blank for a power law, or write any rate law with parameters and give initial guesses.
+- **Arrhenius**: T [K] and k give Ea and A.
+
+The k printed with its units can be pasted into the Reactor tab.
+""" + COMMON

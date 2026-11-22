@@ -64,9 +64,13 @@ def amounts(text: str, si_unit: str, default_unit: str) -> dict[str, float]:
     return {s: quantity(v, si_unit, default_unit) for s, v in mapping(text).items()}
 
 
+_LABEL = re.compile(r"^\s*[A-Za-z_(][^\s:=]*(\s*\[[^\]]*\])?\s*[:=]?\s*")
+
+
 def table_text(text: str) -> list[np.ndarray]:
     rows = []
     for line in text.splitlines():
+        line = _LABEL.sub("", line)
         try:
             row = numbers(line)
         except ValueError:
@@ -142,3 +146,16 @@ def human_K(orders_f: dict, orders_r: dict, basis: str = "C") -> str:
         return "dimensionless"
     unit = "atm" if basis == "P" else "mol/L"
     return unit if n == 1 else f"({unit})^{n:g}"
+
+
+def named_table(text: str) -> dict[str, np.ndarray]:
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) < 2:
+        raise ValueError("Paste a header line with column names and at least one data row")
+    names = re.split(r"[,;\t\s]+", lines[0].strip())
+    rows = [numbers(l) for l in lines[1:]]
+    bad = [i + 2 for i, r in enumerate(rows) if r.size != len(names)]
+    if bad:
+        raise ValueError(f"Line {bad[0]} does not have {len(names)} values ({', '.join(names)})")
+    data = np.array(rows)
+    return {n: data[:, i] for i, n in enumerate(names)}

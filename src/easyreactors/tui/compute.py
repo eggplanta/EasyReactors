@@ -1,4 +1,6 @@
+import math
 from dataclasses import dataclass, field, replace
+from fractions import Fraction
 
 import numpy as np
 
@@ -23,7 +25,9 @@ from ..diffusion.pellet import (effectiveness, eta_first_order, mears, radius_fo
                                 weisz_prater)
 from ..diffusion.transport import (bed_area, colburn, cylinder_dp, effective_diffusivity, frossling,
                                    mt_limited_conversion, thoenes_kramers)
-from .parsing import K_unit, amounts, human_K, human_k, k_unit, mapping, orders, quantity, series
+from ..kinetics.analysis import (arrhenius, differential, fit_expression, integral_scan, linearized, nonlinear,
+                                 power_law)
+from .parsing import K_unit, amounts, human_K, human_k, k_unit, mapping, named_table, orders, quantity, series
 
 MODELS = ["Power law", "Reversible", "Michaelis-Menten", "Expression"]
 RTD_KINDS = ["Pulse C(t)", "Step C(t)", "E(t)"]
@@ -741,4 +745,104 @@ def run_packed_bed(rs: ReactionSet, feed: Stream, mode: str, target: str, R: str
     rep.tables.append(("Along the bed", ["W [g]", "X", "Cb [mol/L]", "Cs [mol/L]", "η", "Ω"], rows))
     rep.plots.append(("Conversion along the bed", res.W * 1000, {"X": res.X}, "W [g]", "X"))
     rep.plots.append(("Effectiveness along the bed", res.W * 1000, {"η": res.eta, "Ω": res.Omega}, "W [g]", "-"))
+    return rep
+
+
+# Kinetics from data
+
+KIN_CALCS = {
+    "Batch data C(t): order and k": "Concentration of one reactant vs time in a constant-volume batch.",
+    "Rate data: fit a rate law": "Measured rates (differential reactor, initial rates) vs concentrations.",
+    "Arrhenius: Ea from k(T)": "Rate constants measured at several temperatures.",
+}
+KIN_METHODS = ["Differential (finite differences)", "Differential (polynomial fit)", "Integral (orders 0, 1, 2)",
+               "Nonlinear regression"]
+
+
+def k_units(n: float, C_unit: str, t_unit: str) -> str:
+    n = round(n, 4)
+    if n == 1:
+        return f"1/{t_unit}"
+    if C_unit == "mol/L" and n in (0, 2):
+        return f"mol/(L*{t_unit})" if n == 0 else f"L/(mol*{t_unit})"
+    return f"({C_unit})^{1 - n:g}/{t_unit}"
+
+
+def _order(text: str) -> float | None:
+    return float(Fraction(text.strip())) if text.strip() else None
+
+
+def run_batch_kinetics(data: str, t_unit: str, C_unit: str, method: str, order: str = "",
+                       degree: str = "") -> Report:
+    t, C = series(_required(data, "C(t) data"))
+    t_unit, C_unit = t_unit.strip() or "min", C_unit.strip() or "mol/L"
+    n = _order(order)
+    rep = Report()
+    if method.startswith("Integral"):
+        fits = integral_scan(t, C, sorted({0, 1, 2} | ({n} if n is not None else set())))
+        best = max(fits, key=lambda f: f.r2)
+        rep.tables.append(("Integral method: linear fit through the origin", ["Order", "k", "Units", "R²"],
+                           [[f"{f.order:g}", f.k, k_units(f.order, C_unit, t_unit), f.r2] for f in fits]))
+        fit = best if n is None else next(f for f in fits if f.order == n)
+        y, label = linearized(t, C, fit.order)
+        rep.plots.append((f"Order {fit.order:g}: {label} vs t", t, {"data": y, "fit": fit.k * t},
+                          f"t [{t_unit}]", label))
+    elif method.startswith("Nonlinear"):
+        fit = nonlinear(t, C, n)
+    else:
+        kind = "finite" if "finite" in method else "polynomial"
+        fit = differential(t, C, kind, int(degree) if degree.strip() else 3, n)
+        ok = fit.rate > 0
+        x = np.log(C[ok])
+        rep.plots.append(("ln(-dC/dt) vs ln C", x, {"data": np.log(fit.rate[ok]),
+                                                    "fit": math.log(fit.k) + fit.order * x}, "ln C", "ln(-dC/dt)"))
+        rep.tables.append(("Processed data", ["t", "C", "-dC/dt", "ln C", "ln(-dC/dt)"],
+                           [[a, b, r, math.log(b), math.log(r) if r > 0 else None]
+                            for a, b, r in zip(t, C, fit.rate)]))
+    units = k_units(fit.order, C_unit, t_unit)
+    rep.summary += [f"Order n = {fit.order:.4g}, k = {fit.k:.4g} {units}  ({fit.method})",
+                    f"R² = {fit.r2:.5f}",
+                    f"Rate law: -rA = {fit.k:.4g} {units} · CA^{fit.order:.4g}"]
+    if n is None and abs(fit.order - round(fit.order)) < 0.1 and not method.startswith("Integral"):
+        rep.summary.append(f"Tip: set the order to {round(fit.order)} and run again to refit k")
+    tt = np.linspace(t[0], t[-1], 200)
+    rep.plots.append(("C(t): data and fitted model", tt, {"data": (t, C), "model": fit.model(tt)},
+                      f"t [{t_unit}]", f"C [{C_unit}]"))
+    return rep
+
+
+def run_rate_kinetics(data: str, expr: str = "", guesses: str = "") -> Report:
+    cols = named_table(_required(data, "Rate data"))
+    names = list(cols)
+    rate_name = next((n for n in names if n.lower() in ("r", "rate", "-r", "-ra", "ra")), names[-1])
+    rate = cols.pop(rate_name)
+    rep = Report()
+    if expr.strip():
+        guess = {k: float(v) for k, v in mapping(_required(guesses, "Initial guesses (a=0.01, b=1)")).items()}
+        fit = fit_expression(expr, cols, rate, guess)
+        rep.summary.append(f"-r = {expr}")
+    else:
+        fit = power_law(cols, rate)
+        rep.summary.append("-r = k · " + " · ".join(f"{c}^order_{c}" for c in cols))
+    rep.summary.append(f"R² = {fit.r2:.5f}  (rates in the units of the data)")
+    rep.tables.append(("Parameters", ["Parameter", "Value"], [[k, v] for k, v in fit.params.items()]))
+    rep.tables.append(("Measured and predicted", [*cols, f"{rate_name} measured", "predicted", "error %"],
+                       [[*(cols[c][i] for c in cols), rate[i], fit.predicted[i],
+                         100 * (fit.predicted[i] - rate[i]) / rate[i]] for i in range(len(rate))]))
+    rep.plots.append(("Parity: predicted vs measured", rate, {"data": fit.predicted, "y = x": rate},
+                      "measured", "predicted"))
+    return rep
+
+
+def run_arrhenius(data: str, k_unit: str = "") -> Report:
+    T, k = series(_required(data, "T and k data"))
+    fit = arrhenius(T, k)
+    unit = k_unit.strip() or "units of k"
+    rep = Report([f"Ea = {fit.Ea / 1000:.4g} kJ/mol (Ea/R = {fit.Ea / R_GAS:.5g} K), A = {fit.A:.4g} {unit}",
+                  f"R² = {fit.r2:.5f}"])
+    rep.tables.append(("Data", ["T [K]", "k", "1/T [1/K]", "ln k", "k fitted"],
+                       [[a, b, 1 / a, math.log(b), fit.A * math.exp(-fit.Ea / (R_GAS * a))] for a, b in zip(T, k)]))
+    x = 1 / T
+    rep.plots.append(("ln k vs 1/T", x * 1000, {"data": np.log(k), "fit": math.log(fit.A) - fit.Ea / R_GAS * x},
+                      "1000/T [1/K]", "ln k"))
     return rep

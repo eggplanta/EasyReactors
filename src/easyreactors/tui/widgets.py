@@ -345,10 +345,15 @@ def plot_text(title: str, x, series: dict, xlabel: str, ylabel: str, width: int)
     f.clear()
     f.theme("dark")
     f.plot_size(max(width, 40), 18)
-    xs = [float(v) for v in x]
-    for i, (name, y) in enumerate(series.items()):
+    items = list(enumerate(series.items()))
+    for i, (name, y) in sorted(items, key=lambda it: it[1][0] == "data"):
         color = PALETTE[i % len(PALETTE)]
-        f.draw(f.signal(xs, [float(v) for v in y], marker=plt.marker("braille", color)).lines().density("full"))
+        xi, y = y if isinstance(y, tuple) else (x, y)
+        pts = [float(v) for v in xi], [float(v) for v in y]
+        if name == "data":
+            f.draw(f.signal(*pts, marker=plt.marker("●", color)))
+        else:
+            f.draw(f.signal(*pts, marker=plt.marker("braille", color)).lines().density("full"))
     f.legend(active=False)
     f.label(xlabel, "x")
     f.label(ylabel, "y")
@@ -356,7 +361,7 @@ def plot_text(title: str, x, series: dict, xlabel: str, ylabel: str, width: int)
     if len(series) > 1:
         out.append("\n ")
         for i, name in enumerate(series):
-            out.append("━━ ", style="rgb({},{},{})".format(*PALETTE[i % len(PALETTE)]))
+            out.append("●  " if name == "data" else "━━ ", style="rgb({},{},{})".format(*PALETTE[i % len(PALETTE)]))
             out.append(f"{name}   ")
     return out
 
