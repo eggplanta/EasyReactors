@@ -41,7 +41,13 @@ def sub(path: str, key) -> str:
     return f"{path}.{key}" if path else str(key)
 
 
+def scalar_check(value, path: str) -> None:
+    if isinstance(value, dict) and ("unknown" in value or "vary" in value):
+        raise SpecError(path, "is a variable; use solve() instead of simulate()")
+
+
 def quantity(value, si_unit: str, path: str) -> float:
+    scalar_check(value, path)
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise SpecError(path, f"expected a number or a string with units ({si_unit})")
     try:
@@ -53,6 +59,7 @@ def quantity(value, si_unit: str, path: str) -> float:
 
 
 def base(value, path: str) -> float:
+    scalar_check(value, path)
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise SpecError(path, "expected a number or a string with units")
     if isinstance(value, str):
@@ -64,6 +71,7 @@ def base(value, path: str) -> float:
 
 
 def number(value, path: str, lo=None, hi=None) -> float:
+    scalar_check(value, path)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise SpecError(path, "expected a number")
     if (lo is not None and value < lo) or (hi is not None and value > hi):
@@ -78,6 +86,7 @@ def amounts(d, si_unit: str, path: str) -> dict[str, float]:
 # Kinetics
 
 def param(value, path: str):
+    scalar_check(value, path)
     if isinstance(value, dict):
         if "Ea" in value:
             obj(value, path, {"A", "Ea", "T_ref"}, ("A", "Ea"))

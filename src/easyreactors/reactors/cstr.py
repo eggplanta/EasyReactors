@@ -48,16 +48,23 @@ class CSTR:
 
     def simulate(self, feed: Stream, V: Value | None = None) -> Result:
         V = to_si(self.V if V is None else V, "m^3")
+        ss = self.steady_states(feed, V)
+        i = self.pick(ss)
+        if self.heat is None and len(ss.states) > 1:
+            warnings.warn(self.multiplicity_note(ss), stacklevel=2)
+        return ss.states[i]
+
+    def pick(self, ss: SteadyStates) -> int:
         if self.heat is not None:
-            return self.steady_states(feed, V).states[0]
-        ss = self._iso_states(feed, V)
+            return 0
+        best = ss.best(key_species(self.reactions, None))
+        return next(i for i, s in enumerate(ss.states) if s is best)
+
+    def multiplicity_note(self, ss: SteadyStates) -> str:
         key = key_species(self.reactions, None)
-        best = ss.best(key)
-        if len(ss.states) > 1:
-            Xs = ", ".join(f"{s.conversion(key):.4g}" for s in ss.states)
-            warnings.warn(f"CSTR has {len(ss.states)} steady states (X_{key} = {Xs}); returning the "
-                          f"highest-conversion stable one. Use steady_states() for all.", stacklevel=2)
-        return best
+        Xs = ", ".join(f"{s.conversion(key):.4g}" for s in ss.states)
+        return (f"CSTR has {len(ss.states)} steady states (X_{key} = {Xs}); returning the "
+                f"highest-conversion stable one. Use steady_states() for all.")
 
     def _newton(self, feed: Stream, V: float) -> Result:
         species, F0, rate = flow_setup(self.reactions, feed, self.rho_b)
@@ -69,7 +76,7 @@ class CSTR:
 
     # Isothermal steady states
 
-    def _iso_states(self, feed: Stream, V: float, n: int = 1500, starts: int = 128) -> SteadyStates:
+    def _iso_states(self, feed: Stream, V: float, n: int = 400, starts: int = 32) -> SteadyStates:
         rxns = self.reactions
         species, F0, rate = flow_setup(rxns, feed, self.rho_b)
         rho = None if self.rho_b is None else to_si(self.rho_b, "kg/m^3")
@@ -212,7 +219,7 @@ def _scan_1d(g, bounds, n, F0, nu_row, species, ref, scale):
     span = hi - lo
     if span <= 0:
         return [np.array([lo])], None, None, None, "X"
-    edge = np.geomspace(1e-10, 0.5, n // 4)
+    edge = np.geomspace(1e-10, 0.5, 60)
     pts = np.unique(np.concatenate([np.linspace(lo, hi, n), lo + span * edge, hi - span * edge]))
     gv = np.array([_safe(g, np.array([p]))[0] for p in pts])
     f = lambda p: _safe(g, np.array([p]))[0]

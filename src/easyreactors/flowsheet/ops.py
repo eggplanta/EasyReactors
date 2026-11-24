@@ -1,4 +1,3 @@
-import warnings
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -221,33 +220,31 @@ class Reactor(Op):
             return {"out": feed}, {"empty": True}
         m = self.model()
         try:
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                res = m.simulate(feed, self.size)
-        except SpecError:
-            raise
+            if self.kind == "cstr":
+                ss = m.steady_states(feed, self.size)
+                i = m.pick(ss)
+                res = ss.states[i]
+            else:
+                ss, i, res = None, None, m.simulate(feed, self.size)
         except (ValueError, RuntimeError) as e:
             raise SpecError(self.path, str(e)) from None
-        rep = self.report(m, feed, res) if final else {}
-        if final and caught:
-            rep["warnings"] = [str(w.message) for w in caught]
+        rep = self.report(feed, res, ss, i) if final else {}
+        if final and ss is not None and self.heat is None and len(ss.states) > 1:
+            rep["warnings"] = [m.multiplicity_note(ss)]
         return {"out": res.outlet}, rep
 
-    def report(self, m, feed, res) -> dict:
+    def report(self, feed, res, ss, selected) -> dict:
         size_key = "W" if self.kind == "pbr" else "V"
         reactants = {s for rx in self.rs.reactions for s in rx.reactants}
         rep = {size_key: self.size,
                "X": {s: res.conversion(s) for s in res.species if s in reactants and res.n0.get(s, 0) > 0}}
         if self.kind != "pbr":
             rep["tau"] = self.size / feed.v
-        if self.kind == "cstr":
-            ss = m.steady_states(feed, self.size)
-            F = np.array([res.outlet.F[s] for s in res.species])
-            dist = [np.abs(np.array([st.outlet.F[s] for s in res.species]) - F).max() for st in ss.states]
+        if ss is not None:
             rep["steady_states"] = [{"T": st.outlet.T, "F": dict(st.outlet.F), "stable": ok,
                                      "X": {s: st.conversion(s) for s in rep["X"]}}
                                     for st, ok in zip(ss.states, ss.stable)]
-            rep["selected"] = int(np.argmin(dist))
+            rep["selected"] = selected
         else:
             prof = {"axis": size_key, "x": res.axis.tolist(),
                     "F": {s: res.profile(s).tolist() for s in res.species}}
