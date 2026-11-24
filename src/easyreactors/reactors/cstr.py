@@ -1,7 +1,9 @@
+import warnings
 from dataclasses import dataclass, replace
 
 import numpy as np
-from scipy.optimize import brentq, minimize_scalar
+from scipy.optimize import brentq, minimize_scalar, root
+from scipy.stats import qmc
 
 from ..core import ReactionSet
 from ..energy.heat import Heat
@@ -15,9 +17,14 @@ from .stream import Stream
 class SteadyStates:
     states: list[Result]
     stable: list[bool]
-    T: np.ndarray
-    G: np.ndarray
-    R: np.ndarray
+    x: np.ndarray | None
+    G: np.ndarray | None
+    R: np.ndarray | None
+    axis: str = "T"
+
+    def best(self, key: str) -> Result:
+        pool = [s for s, ok in zip(self.states, self.stable) if ok] or self.states
+        return max(pool, key=lambda s: s.conversion(key))
 
 
 @dataclass
@@ -43,12 +50,58 @@ class CSTR:
         V = to_si(self.V if V is None else V, "m^3")
         if self.heat is not None:
             return self.steady_states(feed, V).states[0]
+        ss = self._iso_states(feed, V)
+        key = key_species(self.reactions, None)
+        best = ss.best(key)
+        if len(ss.states) > 1:
+            Xs = ", ".join(f"{s.conversion(key):.4g}" for s in ss.states)
+            warnings.warn(f"CSTR has {len(ss.states)} steady states (X_{key} = {Xs}); returning the "
+                          f"highest-conversion stable one. Use steady_states() for all.", stacklevel=2)
+        return best
+
+    def _newton(self, feed: Stream, V: float) -> Result:
         species, F0, rate = flow_setup(self.reactions, feed, self.rho_b)
         scale = F0.sum()
         F = solve(lambda F: (F0 - F + rate(F) * V) / scale, F0, "CSTR")
         if (F < -1e-9 * scale).any():
             raise RuntimeError("CSTR converged to negative flows")
         return self._result(feed, species, F0, F, V, rate)
+
+    # Isothermal steady states
+
+    def _iso_states(self, feed: Stream, V: float, n: int = 1500, starts: int = 128) -> SteadyStates:
+        rxns = self.reactions
+        species, F0, rate = flow_setup(rxns, feed, self.rho_b)
+        rho = None if self.rho_b is None else to_si(self.rho_b, "kg/m^3")
+        nu = np.array([[rx.nu.get(s, 0.0) for s in species] for rx in rxns.reactions])
+        scale = F0.sum()
+
+        def omega(F):
+            C = feed.conc(dict(zip(species, F)))
+            out = []
+            for rx in rxns.reactions:
+                if rx.catalytic and rho is None:
+                    raise ValueError(f"Catalytic reaction needs bulk density rho_b: {rx.equation}")
+                r = rx.species_rates(C, feed.T)[rx.ref] / rx.nu[rx.ref]
+                out.append(r * (rho if rx.catalytic else 1.0))
+            return np.array(out)
+
+        def g(xi):
+            return omega(F0 + nu.T @ xi) * V - xi
+
+        bounds = [_extent_bounds(F0, row) for row in nu]
+        if len(rxns.reactions) == 1:
+            xis, x, G, R, axis = _scan_1d(g, bounds[0], n, F0, nu[0], species, rxns.reactions[0].ref, scale)
+        else:
+            xis, x, G, R, axis = _multistart(g, bounds, F0, nu, scale, starts), None, None, None, "X"
+        if not xis:
+            raise RuntimeError("No CSTR steady state found")
+        states, stable = [], []
+        for xi in xis:
+            F = np.clip(F0 + nu.T @ xi, 0.0, None)
+            states.append(self._result(feed, species, F0, F, V, rate))
+            stable.append(_stable(lambda F: F0 - F + rate(F) * V, F, scale))
+        return SteadyStates(states, stable, x, G, R, axis)
 
     def size(self, feed: Stream, X: float, key: str | None = None) -> Result:
         if self.heat is not None:
@@ -119,8 +172,10 @@ class CSTR:
     def steady_states(self, feed: Stream, V: Value | None = None, T_range: tuple[float, float] | None = None,
                       n: int = 800) -> SteadyStates:
         V = to_si(self.V if V is None else V, "m^3")
+        if self.heat is None:
+            return self._iso_states(feed, V)
         iso = self._iso()
-        at = lambda T: iso.simulate(replace(feed, T=float(T)), V)
+        at = lambda T: iso._newton(replace(feed, T=float(T)), V)
         Ts, G, R, roots = self._scan(feed, at, T_range, n)
         if not roots:
             raise RuntimeError("No steady state found in the temperature range")
@@ -140,3 +195,85 @@ class CSTR:
             raise RuntimeError(f"No temperature satisfies both balances for X = {X}")
         T = roots[0][0]
         return self._at(feed, at(T), T)
+
+
+def _extent_bounds(F0, nu_row) -> tuple[float, float]:
+    lo, hi = -np.inf, np.inf
+    for f, v in zip(F0, nu_row):
+        if v > 0:
+            lo = max(lo, -f / v)
+        elif v < 0:
+            hi = min(hi, f / -v)
+    return (0.0 if not np.isfinite(lo) else lo), (0.0 if not np.isfinite(hi) else hi)
+
+
+def _scan_1d(g, bounds, n, F0, nu_row, species, ref, scale):
+    lo, hi = bounds
+    span = hi - lo
+    if span <= 0:
+        return [np.array([lo])], None, None, None, "X"
+    edge = np.geomspace(1e-10, 0.5, n // 4)
+    pts = np.unique(np.concatenate([np.linspace(lo, hi, n), lo + span * edge, hi - span * edge]))
+    gv = np.array([_safe(g, np.array([p]))[0] for p in pts])
+    f = lambda p: _safe(g, np.array([p]))[0]
+    tol = 1e-12 * scale
+    roots = [p for p, v in zip(pts, gv) if abs(v) <= tol]
+    for j in range(len(pts) - 1):
+        a, b = gv[j], gv[j + 1]
+        if np.isfinite(a) and np.isfinite(b) and abs(a) > tol and abs(b) > tol and a * b < 0:
+            roots.append(brentq(f, pts[j], pts[j + 1], xtol=1e-14 * max(span, 1.0), rtol=1e-13))
+    roots = _dedupe([np.array([r]) for r in sorted(roots)], span)
+    i = species.index(ref)
+    nr = -nu_row[i]
+    R = nr * pts
+    G = R + nr * gv
+    x = R / F0[i] if F0[i] > 0 else pts
+    return roots, x, G, R, f"X_{ref}"
+
+
+def _multistart(g, bounds, F0, nu, scale, starts):
+    lo = np.array([b[0] for b in bounds])
+    hi = np.array([b[1] for b in bounds])
+    pts = qmc.scale(qmc.Sobol(len(bounds), seed=0).random(starts), lo, np.maximum(hi, lo + 1e-300))
+    pts = np.vstack([np.zeros(len(bounds)), pts])
+    pts = [p for p in pts if (F0 + nu.T @ p >= -1e-12 * scale).all()]
+    found = []
+    for p in pts:
+        try:
+            with np.errstate(all="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                sol = root(lambda xi: g(xi) / scale, p, method="hybr", tol=1e-12)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            continue
+        if (np.all(np.isfinite(sol.fun)) and np.abs(sol.fun).max() < 1e-9
+                and (F0 + nu.T @ sol.x >= -1e-9 * scale).all()):
+            found.append(sol.x)
+    return _dedupe(found, max(np.abs(hi - lo).max(), scale * 1e-12))
+
+
+def _safe(g, xi):
+    try:
+        with np.errstate(all="ignore"):
+            return np.asarray(g(xi), float)
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return np.full(len(xi), np.nan)
+
+
+def _dedupe(xis, span, rtol=1e-6):
+    out = []
+    for xi in xis:
+        if all(np.abs(xi - o).max() > rtol * span for o in out):
+            out.append(xi)
+    return out
+
+
+def _stable(res, F, scale) -> bool:
+    n = len(F)
+    J = np.empty((n, n))
+    f0 = res(F)
+    for k in range(n):
+        h = 1e-7 * max(F[k], 1e-6 * scale)
+        Fp = F.copy()
+        Fp[k] += h
+        J[:, k] = (res(Fp) - f0) / h
+    return bool(np.linalg.eigvals(J).real.max() < 0)

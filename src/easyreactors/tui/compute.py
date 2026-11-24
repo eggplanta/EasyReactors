@@ -313,8 +313,11 @@ def run_flow_reactor(kind: str, mode: str, rs: ReactionSet, feed: Stream, V: str
     else:
         reactor = (CSTR if kind == "CSTR" else PFR)(rs, heat=heat)
     fmt_size = (lambda w: f"{w:.4g} kg") if pbr else (lambda v: fmt_volume(v)[2:])
-    if kind == "CSTR" and heat is not None and mode == "Simulate":
-        return _cstr_states(rep, reactor, feed, quantity(_required(V, "Volume"), "m^3", "L"), _key(rs, key))
+    if kind == "CSTR" and mode == "Simulate":
+        Vs = quantity(_required(V, "Volume"), "m^3", "L")
+        ss = reactor.steady_states(feed, Vs)
+        if heat is not None or len(ss.states) > 1:
+            return _cstr_states(rep, ss, feed, Vs, _key(rs, key), heat is not None)
     if mode == "Maximize":
         if heat is not None and kind == "CSTR":
             raise ValueError("Maximize with energy balance: use PFR, or Simulate the CSTR")
@@ -353,8 +356,7 @@ def run_flow_reactor(kind: str, mode: str, rs: ReactionSet, feed: Stream, V: str
     return rep
 
 
-def _cstr_states(rep: Report, reactor: CSTR, feed: Stream, V: float, key: str) -> Report:
-    ss = reactor.steady_states(feed, V)
+def _cstr_states(rep: Report, ss, feed: Stream, V: float, key: str, energy: bool) -> Report:
     n = len(ss.states)
     rep.summary.insert(0, f"CSTR: V = {fmt_volume(V)[2:]}, τ = {V / feed.v / 60:.4g} min, "
                           f"{n} steady state{'s' if n > 1 else ''}")
@@ -369,10 +371,15 @@ def _cstr_states(rep: Report, reactor: CSTR, feed: Stream, V: float, key: str) -
     rep.tables.append((f"Outlet, steady state 1 (T = {ss.states[0].outlet.T:.4g} K)", STREAM_HEADERS,
                        _stream_rows(feed, ss.states[0].outlet, species)))
     F0 = feed.F[key]
-    ok = np.isfinite(ss.G)
-    rep.plots.append(("Heat generated G(T) and removed R(T)", ss.T[ok],
-                      {"G(T)": ss.G[ok] / F0 / 1000, "R(T)": ss.R[ok] / F0 / 1000}, "T [K]",
-                      f"kJ per mol {key} fed"))
+    if energy:
+        ok = np.isfinite(ss.G)
+        rep.plots.append(("Heat generated G(T) and removed R(T)", ss.x[ok],
+                          {"G(T)": ss.G[ok] / F0 / 1000, "R(T)": ss.R[ok] / F0 / 1000}, "T [K]",
+                          f"kJ per mol {key} fed"))
+    elif ss.G is not None:
+        ok = np.isfinite(ss.G)
+        rep.plots.append(("Generation -r·V and removal F0·X", ss.x[ok],
+                          {"G": ss.G[ok] * 60, "R": ss.R[ok] * 60}, ss.axis, "mol/min"))
     if n > 1:
         rep.summary.append("Multiple steady states: start-up conditions decide which one is reached")
     return rep
